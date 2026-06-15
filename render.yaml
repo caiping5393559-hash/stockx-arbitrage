@@ -3,7 +3,7 @@ services:
     name: stockx-goat-scanner
     runtime: docker
     plan: free
-    autoDeploy: false
+    autoDeploy: true
     healthCheckPath: /_stcore/health
     envVars:
       - key: APP_LOGIN_ENABLED
