@@ -7187,31 +7187,35 @@ def _require_app_login(settings) -> bool:
         """
         <style>
         div[data-testid="stAppViewContainer"] .main .block-container {
-            max-width: 520px;
-            padding-top: 12vh;
-        }
-        div[data-testid="stAppViewContainer"] h1 {
-            font-size: 2rem;
-            line-height: 1.15;
-            margin-bottom: .35rem;
+            padding-top: 10vh;
         }
         div[data-testid="stForm"] {
-            padding: 1.1rem 1.2rem .9rem;
+            padding: 1rem 1.1rem .85rem;
             border: 1px solid #d9dee7;
             border-radius: 12px;
             background: #ffffff;
-            box-shadow: 0 12px 32px rgba(15, 23, 42, .08);
+            box-shadow: 0 12px 30px rgba(15, 23, 42, .08);
+        }
+        div[data-testid="stForm"] button {
+            height: 2.6rem;
+        }
+        @media (max-width: 900px) {
+            div[data-testid="column"]:empty {
+                display: none;
+            }
         }
         </style>
         """,
         unsafe_allow_html=True,
     )
-    st.title("套利扫描器登录")
-    st.caption("登录后进入 StockX / GOAT 套利扫描器。")
-    with st.form("app_login_form"):
-        username = st.text_input("账号")
-        password = st.text_input("密码", type="password")
-        submitted = st.form_submit_button("登录", use_container_width=True)
+    left, center, right = st.columns([1.15, 0.72, 1.15])
+    with center:
+        st.markdown("## 套利扫描器登录")
+        st.caption("登录后进入 StockX / GOAT 套利扫描器。")
+        with st.form("app_login_form"):
+            username = st.text_input("账号")
+            password = st.text_input("密码", type="password")
+            submitted = st.form_submit_button("登录", use_container_width=True)
     if submitted:
         username_ok = hmac.compare_digest(str(username or ""), str(settings.app_username or ""))
         password_ok = hmac.compare_digest(str(password or ""), str(settings.app_password or ""))
