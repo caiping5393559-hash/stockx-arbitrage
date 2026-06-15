@@ -2,7 +2,7 @@ services:
   - type: web
     name: stockx-goat-scanner
     runtime: docker
-    plan: starter
+    plan: free
     autoDeploy: false
     healthCheckPath: /_stcore/health
     disk:
