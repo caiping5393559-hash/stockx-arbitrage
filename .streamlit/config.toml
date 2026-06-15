@@ -1,0 +1,13 @@
+[server]
+runOnSave = false
+folderWatchBlacklist = ["data"]
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "light"
+primaryColor = "#ef4444"
+backgroundColor = "#f5f6f8"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#111827"
