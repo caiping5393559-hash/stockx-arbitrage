@@ -1022,19 +1022,270 @@ def _apply_opportunity_search_snapshot(snapshot: dict[str, Any]) -> None:
         st.session_state[key] = snapshot.get(key, default)
 
 
+GOAT_HEADER_ALIASES = {
+    "pid": {
+        "pid",
+        "productid",
+        "product_id",
+        "productidentifier",
+        "productvariantid",
+        "variantid",
+        "inventoryid",
+        "itemid",
+        "listingid",
+    },
+    "style_no": {
+        "sku",
+        "style",
+        "styleno",
+        "style_no",
+        "style number",
+        "stylenumber",
+        "productsku",
+        "product_sku",
+        "merchant sku",
+        "merchantsku",
+        "itemsku",
+        "货号",
+        "款号",
+        "商品货号",
+    },
+    "size": {
+        "size",
+        "usize",
+        "us_size",
+        "goatsize",
+        "goat_size",
+        "shoe size",
+        "shoesize",
+        "尺码",
+        "码数",
+        "us尺码",
+    },
+    "price": {
+        "price",
+        "goatprice",
+        "goat_price",
+        "unitprice",
+        "unit_price",
+        "listprice",
+        "list_price",
+        "saleprice",
+        "sale_price",
+        "askprice",
+        "ask_price",
+        "amount",
+        "价格",
+        "goat价格",
+        "采购价",
+    },
+    "price_cents": {
+        "pricecents",
+        "price_cents",
+        "amountcents",
+        "amount_cents",
+    },
+    "title": {
+        "title",
+        "name",
+        "productname",
+        "product_name",
+        "producttemplatename",
+        "product_template_name",
+        "商品名",
+        "名称",
+    },
+    "warehouse_id": {"warehouseid", "warehouse_id", "仓库id"},
+    "warehouse_name": {"warehousename", "warehouse_name", "warehouse", "仓库", "仓库名"},
+    "product_template_id": {"producttemplateid", "product_template_id", "templateid", "template_id"},
+    "sale_status": {"salestatus", "sale_status", "status", "状态"},
+}
+
+
+def _goat_header_key(value: Any) -> str:
+    return re.sub(r"[\s_\-./()（）:：#]+", "", str(value or "").strip().lower())
+
+
+def _goat_aliases(field: str) -> set[str]:
+    return {_goat_header_key(alias) for alias in GOAT_HEADER_ALIASES.get(field, set())}
+
+
+def _goat_header_score(values: list[Any]) -> int:
+    aliases = {_goat_header_key(alias) for names in GOAT_HEADER_ALIASES.values() for alias in names}
+    score = 0
+    for value in values:
+        key = _goat_header_key(value)
+        if key in aliases:
+            score += 2
+        elif any(alias and alias in key for alias in aliases if len(alias) >= 4):
+            score += 1
+    return score
+
+
+def _make_unique_columns(values: list[Any]) -> list[str]:
+    counts: dict[str, int] = {}
+    columns: list[str] = []
+    for idx, value in enumerate(values):
+        base = str(value or "").strip() or f"column_{idx + 1}"
+        count = counts.get(base, 0)
+        counts[base] = count + 1
+        columns.append(base if count == 0 else f"{base}_{count + 1}")
+    return columns
+
+
+def _goat_frame_from_raw(raw: pd.DataFrame) -> pd.DataFrame:
+    if raw.empty:
+        return raw
+    best_idx = 0
+    best_score = -1
+    for idx in range(min(len(raw), 25)):
+        values = [None if pd.isna(v) else v for v in raw.iloc[idx].tolist()]
+        score = _goat_header_score(values)
+        if score > best_score:
+            best_idx = idx
+            best_score = score
+    if best_score >= 2:
+        frame = raw.iloc[best_idx + 1 :].copy()
+        frame.columns = _make_unique_columns([None if pd.isna(v) else v for v in raw.iloc[best_idx].tolist()])
+        return frame.dropna(how="all").reset_index(drop=True)
+    frame = raw.copy()
+    frame.columns = _make_unique_columns(frame.columns.tolist())
+    return frame.dropna(how="all").reset_index(drop=True)
+
+
 def _read_goat_consignment_frame(file_name: str, content: bytes) -> pd.DataFrame:
     suffix = Path(file_name).suffix.lower()
-    if suffix == ".xlsx":
-        return pd.read_excel(BytesIO(content))
-    return pd.read_csv(BytesIO(content))
+    if suffix in {".xlsx", ".xls"}:
+        sheets = pd.read_excel(BytesIO(content), sheet_name=None, header=None)
+        frames = [_goat_frame_from_raw(sheet) for sheet in sheets.values()]
+        frames = [frame for frame in frames if not frame.empty]
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    raw = pd.read_csv(BytesIO(content), header=None)
+    return _goat_frame_from_raw(raw)
 
 
-def _goat_price_from_row(row: dict[str, Any]) -> float | None:
-    if row.get("PRICE_CENTS") not in (None, ""):
-        return float(row["PRICE_CENTS"]) / 100.0
+def _goat_find_column(columns: list[str], field: str) -> str | None:
+    aliases = _goat_aliases(field)
+    normalized = {column: _goat_header_key(column) for column in columns}
+    for column, key in normalized.items():
+        if key in aliases:
+            return column
+    for column, key in normalized.items():
+        if any(alias and alias in key for alias in aliases if len(alias) >= 4):
+            return column
+    return None
+
+
+def _goat_number_from_value(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    text = re.sub(r"[^0-9.\-]", "", text)
+    if text in {"", ".", "-", "-."}:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _goat_content_score(series: pd.Series, field: str, used: set[str]) -> float:
+    if str(series.name) in used:
+        return -1
+    values = [None if pd.isna(v) else v for v in series.head(200).tolist()]
+    nonempty = [v for v in values if v not in (None, "")]
+    if not nonempty:
+        return -1
+    if field == "pid":
+        hits = 0
+        for value in nonempty:
+            text = re.sub(r"\D", "", str(value))
+            if 5 <= len(text) <= 12:
+                hits += 1
+        return hits / max(len(nonempty), 1)
+    if field == "style_no":
+        hits = 0
+        for value in nonempty:
+            style = normalize_style_no(value)
+            compact = re.sub(r"[^A-Z0-9]", "", str(style or "").upper())
+            if style and 5 <= len(compact) <= 14 and re.search(r"[A-Z]", compact) and re.search(r"\d", compact):
+                hits += 1
+        return hits / max(len(nonempty), 1)
+    if field == "size":
+        hits = 0
+        for value in nonempty:
+            size = normalize_us_size(value)
+            number = _goat_number_from_value(size)
+            if size and number is not None and 1 <= number <= 25:
+                hits += 1
+        return hits / max(len(nonempty), 1)
+    if field in {"price", "price_cents"}:
+        nums = [_goat_number_from_value(v) for v in nonempty]
+        nums = [n for n in nums if n is not None]
+        if not nums:
+            return -1
+        if field == "price_cents":
+            hits = sum(500 <= n <= 500000 for n in nums)
+        else:
+            hits = sum(5 <= n <= 5000 for n in nums)
+        return hits / max(len(nonempty), 1)
+    return -1
+
+
+def _goat_detect_column_by_content(frame: pd.DataFrame, field: str, used: set[str]) -> str | None:
+    best_column = None
+    best_score = 0.0
+    for column in frame.columns:
+        score = _goat_content_score(frame[column], field, used)
+        if score > best_score:
+            best_column = str(column)
+            best_score = score
+    threshold = 0.55 if field in {"pid", "style_no"} else 0.45
+    return best_column if best_column and best_score >= threshold else None
+
+
+def _goat_detect_columns(frame: pd.DataFrame) -> dict[str, str]:
+    columns = [str(column) for column in frame.columns]
+    mapping: dict[str, str] = {}
+    used: set[str] = set()
+    for field in ["pid", "style_no", "size", "price_cents", "price", "title", "warehouse_id", "warehouse_name", "product_template_id", "sale_status"]:
+        column = _goat_find_column(columns, field)
+        if column and column not in used:
+            mapping[field] = column
+            used.add(column)
+    for field in ["pid", "style_no", "size", "price"]:
+        if field not in mapping:
+            column = _goat_detect_column_by_content(frame, field, used)
+            if column:
+                mapping[field] = column
+                used.add(column)
+    return mapping
+
+
+def _goat_row_value(row: dict[str, Any], mapping: dict[str, str], field: str, *fallbacks: str) -> Any:
+    column = mapping.get(field)
+    if column and row.get(column) not in (None, ""):
+        return row.get(column)
+    for key in fallbacks:
+        if row.get(key) not in (None, ""):
+            return row.get(key)
+    return None
+
+
+def _goat_price_from_row(row: dict[str, Any], mapping: dict[str, str] | None = None) -> float | None:
+    mapping = mapping or {}
+    cents_value = _goat_row_value(row, mapping, "price_cents", "PRICE_CENTS")
+    if cents_value not in (None, ""):
+        cents = _goat_number_from_value(cents_value)
+        return cents / 100.0 if cents is not None else None
+    price_value = _goat_row_value(row, mapping, "price", "PRICE", "GOAT_PRICE", "price", "goat_price")
+    if price_value not in (None, ""):
+        return _goat_number_from_value(price_value)
     for key in ("PRICE", "GOAT_PRICE", "price", "goat_price"):
         if row.get(key) not in (None, ""):
-            return float(str(row[key]).replace("$", "").replace(",", ""))
+            return _goat_number_from_value(row[key])
     return None
 
 
@@ -1052,8 +1303,9 @@ def _goat_import_record_rank(record: dict[str, Any]) -> tuple[float, int, str]:
     return float(record.get("goat_price") or 999999), clean_penalty, str(record.get("pid") or "")
 
 
-def _goat_product_id_from_row(raw: dict[str, Any]) -> str:
-    value = raw.get("PRODUCT_ID")
+def _goat_product_id_from_row(raw: dict[str, Any], mapping: dict[str, str] | None = None) -> str:
+    mapping = mapping or {}
+    value = _goat_row_value(raw, mapping, "pid", "PRODUCT_ID", "PID", "product_id", "pid")
     return str(value).strip() if value not in (None, "") else ""
 
 
@@ -1139,31 +1391,46 @@ def _import_goat_consignment_rows(conn, frame: pd.DataFrame, *, source_name: str
     import_batch = f"{source_name}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
     now = datetime.utcnow().isoformat(timespec="seconds")
     records_by_style_size: dict[tuple[str, str], dict[str, Any]] = {}
+    column_mapping = _goat_detect_columns(frame)
+    required_missing = [field for field in ("pid", "style_no", "size", "price") if field not in column_mapping]
+    if required_missing:
+        log_sync(
+            conn,
+            "GOAT导入表头识别不完整",
+            event_type="goat_import_header_warning",
+            details={
+                "missing": required_missing,
+                "columns": [str(column) for column in frame.columns],
+                "mapping": column_mapping,
+            },
+        )
     for _, series in frame.iterrows():
         raw = {str(k): (None if pd.isna(v) else v) for k, v in series.to_dict().items()}
-        pid = _goat_product_id_from_row(raw)
-        style_no = normalize_style_no(raw.get("SKU") or raw.get("STYLE_NO") or raw.get("style_no"))
-        size = normalize_us_size(raw.get("SIZE") or raw.get("US_SIZE") or raw.get("size"))
-        goat_price = _goat_price_from_row(raw)
+        pid = _goat_product_id_from_row(raw, column_mapping)
+        raw_style = _goat_row_value(raw, column_mapping, "style_no", "SKU", "STYLE_NO", "style_no")
+        raw_size = _goat_row_value(raw, column_mapping, "size", "SIZE", "US_SIZE", "size")
+        style_no = normalize_style_no(raw_style)
+        size = normalize_us_size(raw_size)
+        goat_price = _goat_price_from_row(raw, column_mapping)
         if not pid or not style_no or not size or goat_price is None:
             continue
         buy_cost = round(float(goat_price) * 1.03, 2)
         record = {
             "import_batch": import_batch,
-            "warehouse_id": str(raw.get("WAREHOUSE_ID") or ""),
-            "warehouse_name": str(raw.get("WAREHOUSE_NAME") or ""),
+            "warehouse_id": str(_goat_row_value(raw, column_mapping, "warehouse_id", "WAREHOUSE_ID") or ""),
+            "warehouse_name": str(_goat_row_value(raw, column_mapping, "warehouse_name", "WAREHOUSE_NAME") or ""),
             "pid": pid,
-            "product_template_id": str(raw.get("PRODUCT_TEMPLATE_ID") or ""),
+            "product_template_id": str(_goat_row_value(raw, column_mapping, "product_template_id", "PRODUCT_TEMPLATE_ID") or ""),
             "style_no": style_no,
             "size": size,
-            "title": str(raw.get("PRODUCT_TEMPLATE_NAME") or raw.get("TITLE") or ""),
-            "sale_status": str(raw.get("SALE_STATUS") or ""),
+            "title": str(_goat_row_value(raw, column_mapping, "title", "PRODUCT_TEMPLATE_NAME", "TITLE") or ""),
+            "sale_status": str(_goat_row_value(raw, column_mapping, "sale_status", "SALE_STATUS") or ""),
             "goat_price": round(float(goat_price), 2),
             "buy_cost": buy_cost,
             "raw_row_json": json_dumps(raw),
             "imported_at": now,
             "_clean_sku": _goat_raw_sku_exactly_matches_style(
-                raw.get("SKU") or raw.get("STYLE_NO") or raw.get("style_no"),
+                raw_style,
                 style_no,
             ),
         }
@@ -1171,6 +1438,18 @@ def _import_goat_consignment_rows(conn, frame: pd.DataFrame, *, source_name: str
         current = records_by_style_size.get(key)
         if current is None or _goat_import_record_rank(record) < _goat_import_record_rank(current):
             records_by_style_size[key] = record
+
+    log_sync(
+        conn,
+        f"GOAT导入列识别：导入 {len(records_by_style_size)} 行",
+        event_type="goat_import_header_mapping",
+        details={
+            "mapping": column_mapping,
+            "columns": [str(column) for column in frame.columns],
+            "imported": len(records_by_style_size),
+            "source_name": source_name,
+        },
+    )
 
     for record in records_by_style_size.values():
         conn.execute(
@@ -6904,8 +7183,31 @@ def _require_app_login(settings) -> bool:
     if st.session_state.get("app_authenticated"):
         return True
 
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stAppViewContainer"] .main .block-container {
+            max-width: 520px;
+            padding-top: 12vh;
+        }
+        div[data-testid="stAppViewContainer"] h1 {
+            font-size: 2rem;
+            line-height: 1.15;
+            margin-bottom: .35rem;
+        }
+        div[data-testid="stForm"] {
+            padding: 1.1rem 1.2rem .9rem;
+            border: 1px solid #d9dee7;
+            border-radius: 12px;
+            background: #ffffff;
+            box-shadow: 0 12px 32px rgba(15, 23, 42, .08);
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
     st.title("套利扫描器登录")
-    st.caption("云端访问需要先登录。StockX Token/Auth 不会显示在页面上。")
+    st.caption("登录后进入 StockX / GOAT 套利扫描器。")
     with st.form("app_login_form"):
         username = st.text_input("账号")
         password = st.text_input("密码", type="password")
