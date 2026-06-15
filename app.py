@@ -42,7 +42,7 @@ from src.analytics import (
 )
 from src.config import BASE_DIR, get_settings
 from src.db import connect, init_db, json_dumps, json_loads, log_sync, query_rows, upsert_reference_price
-from src.firebase_cloud import firebase_status
+from src.firebase_cloud import backup_sqlite_to_firestore, firebase_status, restore_sqlite_backup_if_needed
 from src.importer import import_sku_file, list_imported_skus
 from src.portfolio import add_trade, portfolio_summary
 from src.parsing import extract_product, extract_product_uuid, extract_release_date, extract_size_variants, normalize_style_no
@@ -2202,6 +2202,7 @@ def _run_goat_consignment_job(
             error=None,
             finished_at=datetime.utcnow().isoformat(timespec="seconds"),
         )
+        schedule_cloud_backup("goat_consignment_done")
     except Exception as exc:  # noqa: BLE001
         try:
             log_sync(
@@ -2499,6 +2500,34 @@ def get_conn():
     conn = connect()
     init_db(conn)
     return conn
+
+
+def schedule_cloud_backup(reason: str) -> None:
+    settings = get_settings()
+    if not settings.firebase_enabled:
+        return
+
+    db_path = Path(settings.db_path)
+
+    def worker() -> None:
+        try:
+            backup_sqlite_to_firestore(db_path, reason=reason)
+        except Exception as exc:  # noqa: BLE001
+            try:
+                with connect(db_path) as conn:
+                    init_db(conn)
+                    log_sync(
+                        conn,
+                        f"Firebase SQLite 备份失败：{exc}",
+                        severity="error",
+                        event_type="firebase_backup_error",
+                        details={"reason": reason, "error": str(exc)},
+                    )
+                    conn.commit()
+            except Exception:
+                pass
+
+    threading.Thread(target=worker, daemon=True).start()
 
 
 def sync_style_isolated(
@@ -3038,6 +3067,7 @@ def _run_sync_job(
             recomputed=recomputed,
             finished_at=datetime.utcnow().isoformat(timespec="seconds"),
         )
+        schedule_cloud_backup("stockx_sync_done")
     except Exception as exc:  # noqa: BLE001
         log_sync(
             main_conn,
@@ -3156,6 +3186,7 @@ def render_sku_upload_panel(conn, *, key_prefix: str, default_source: str = "man
         result = import_sku_file(conn, file_name=uploaded.name, content=content, source_name=source_name or "manual")
         conn.commit()
         bump_data_cache_version()
+        schedule_cloud_backup("sku_import")
         st.session_state["sync_notice"] = (
             f"导入完成：识别 {result.rows_imported}/{result.rows_seen} 行；"
             f"sheet：{', '.join(result.sheet_names)}；源文件已保存到 {_path_display(saved_path)}。"
@@ -6885,6 +6916,10 @@ def main() -> None:
     settings = get_settings()
     if not _require_app_login(settings):
         return
+    try:
+        restore_sqlite_backup_if_needed(Path(settings.db_path))
+    except Exception:
+        pass
     conn = get_conn()
     _refresh_cache_after_sync_if_needed()
     st.sidebar.title("套利扫描器")

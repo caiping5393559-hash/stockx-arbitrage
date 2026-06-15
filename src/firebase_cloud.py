@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import base64
+import gzip
 import json
+import sqlite3
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -94,3 +97,111 @@ def write_cloud_event(event_type: str, payload: dict[str, Any]) -> None:
             "created_at": utc_now(),
         }
     )
+
+
+def _backup_root(db, settings):
+    return db.collection(settings.firebase_collection_prefix).document("sqlite_backup")
+
+
+def restore_sqlite_backup_if_needed(db_path: Path | str) -> bool:
+    settings = get_settings()
+    if not settings.firebase_enabled:
+        return False
+    path = Path(db_path)
+    if path.exists() and path.stat().st_size > 32768:
+        return False
+
+    db = firestore_client()
+    if db is None:
+        return False
+    root = _backup_root(db, settings)
+    meta = root.get()
+    if not meta.exists:
+        return False
+    meta_data = meta.to_dict() or {}
+    chunk_count = int(meta_data.get("chunk_count") or 0)
+    if chunk_count <= 0:
+        return False
+
+    encoded_parts: list[str] = []
+    chunks = root.collection("chunks").order_by("index").stream()
+    for doc in chunks:
+        data = doc.to_dict() or {}
+        encoded = data.get("data")
+        if encoded:
+            encoded_parts.append(str(encoded))
+    if len(encoded_parts) != chunk_count:
+        return False
+
+    compressed = base64.b64decode("".join(encoded_parts))
+    raw = gzip.decompress(compressed)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".restore.tmp")
+    tmp.write_bytes(raw)
+    tmp.replace(path)
+    write_cloud_event(
+        "sqlite_backup_restored",
+        {"db_path": str(path), "size": len(raw), "backup_updated_at": meta_data.get("updated_at")},
+    )
+    return True
+
+
+def backup_sqlite_to_firestore(db_path: Path | str, *, reason: str = "manual") -> dict[str, Any]:
+    settings = get_settings()
+    if not settings.firebase_enabled:
+        return {"ok": False, "message": "Firebase disabled"}
+    path = Path(db_path)
+    if not path.exists():
+        return {"ok": False, "message": f"SQLite file not found: {path}"}
+
+    max_mb = float(getattr(settings, "firebase_sqlite_backup_max_mb", 200) or 200)
+    if path.stat().st_size > max_mb * 1024 * 1024:
+        return {"ok": False, "message": f"SQLite file is larger than backup limit: {max_mb} MB"}
+
+    db = firestore_client()
+    if db is None:
+        return {"ok": False, "message": "Firestore client not initialized"}
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        copy_path = Path(tmp_dir) / "stockx_arbitrage.sqlite"
+        source = sqlite3.connect(path, timeout=60)
+        try:
+            dest = sqlite3.connect(copy_path)
+            try:
+                source.backup(dest)
+            finally:
+                dest.close()
+        finally:
+            source.close()
+
+        raw = copy_path.read_bytes()
+
+    compressed = gzip.compress(raw, compresslevel=6)
+    encoded = base64.b64encode(compressed).decode("ascii")
+    chunk_size = 650_000
+    chunks = [encoded[index : index + chunk_size] for index in range(0, len(encoded), chunk_size)]
+    root = _backup_root(db, settings)
+
+    old_chunks = list(root.collection("chunks").stream())
+    batch = db.batch()
+    for doc in old_chunks:
+        batch.delete(doc.reference)
+    batch.commit()
+
+    for start in range(0, len(chunks), 400):
+        batch = db.batch()
+        for index, chunk in enumerate(chunks[start : start + 400], start=start):
+            batch.set(root.collection("chunks").document(f"{index:06d}"), {"index": index, "data": chunk})
+        batch.commit()
+
+    meta = {
+        "updated_at": utc_now(),
+        "reason": reason,
+        "raw_size": len(raw),
+        "compressed_size": len(compressed),
+        "encoded_size": len(encoded),
+        "chunk_count": len(chunks),
+    }
+    root.set(meta)
+    write_cloud_event("sqlite_backup_saved", meta)
+    return {"ok": True, **meta}

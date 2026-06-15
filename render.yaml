@@ -20,6 +20,8 @@ services:
         value: stockx_goat
       - key: FIREBASE_SERVICE_ACCOUNT_B64
         sync: false
+      - key: FIREBASE_SQLITE_BACKUP_MAX_MB
+        value: "1500"
       - key: STOCKX_HOST
         value: http://43.136.43.128:61030/api/stockx
       - key: STOCKX_TOKEN

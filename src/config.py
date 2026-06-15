@@ -135,6 +135,7 @@ class Settings:
     firebase_credentials_path: str = field(default_factory=lambda: _str_env("FIREBASE_CREDENTIALS_PATH"))
     firebase_service_account_json: str = field(default_factory=lambda: _str_env("FIREBASE_SERVICE_ACCOUNT_JSON"))
     firebase_service_account_b64: str = field(default_factory=lambda: _str_env("FIREBASE_SERVICE_ACCOUNT_B64"))
+    firebase_sqlite_backup_max_mb: float = field(default_factory=lambda: _float_env("FIREBASE_SQLITE_BACKUP_MAX_MB", 1500.0))
     host: str = field(default_factory=lambda: _str_env("STOCKX_HOST", "http://43.136.43.128:61030/api/stockx").rstrip("/"))
     token: str = field(default_factory=lambda: _str_env("STOCKX_TOKEN"))
     auth: str = field(default_factory=lambda: _str_env("STOCKX_AUTH"))
@@ -176,6 +177,7 @@ def get_settings() -> Settings:
         firebase_credentials_path=values.get("FIREBASE_CREDENTIALS_PATH", "").strip(),
         firebase_service_account_json=values.get("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip(),
         firebase_service_account_b64=values.get("FIREBASE_SERVICE_ACCOUNT_B64", "").strip(),
+        firebase_sqlite_backup_max_mb=_float_from_values(values, "FIREBASE_SQLITE_BACKUP_MAX_MB", 1500.0),
         host=values.get("STOCKX_HOST", "http://43.136.43.128:61030/api/stockx").rstrip("/"),
         token=values.get("STOCKX_TOKEN", "").strip(),
         auth=values.get("STOCKX_AUTH", "").strip(),
