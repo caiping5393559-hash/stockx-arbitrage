@@ -514,6 +514,7 @@ GOAT_DEFAULT_CONSIGNMENT_PATH = Path(
     r"C:\Users\caipi\xwechat_files\qq543399463_ebfa\temp\RWTemp\2026-06\5c4b0f3d59e6e60c2168578703c4722e\untitled_report-query_2-c842066d6501-2026-06-10-00-44-22.csv"
 )
 GOAT_UPLOAD_DIR = BASE_DIR / "data" / "goat_uploads"
+SKU_UPLOAD_DIR = BASE_DIR / "data" / "sku_uploads"
 PAUSED_STOCKX_TASK_PATH = BASE_DIR / "data" / "paused_stockx_task.json"
 AUTO_HOURLY_SYNC_POLL_SECONDS = 60
 AUTO_HOURLY_SYNC_MIN_INTERVAL_SECONDS = 15 * 60
@@ -3132,6 +3133,40 @@ def _path_display(value: Path | str) -> str:
         return str(path)
 
 
+def _save_uploaded_file_copy(uploaded: Any, directory: Path, *, prefix: str) -> tuple[bytes, Path]:
+    content = uploaded.getvalue()
+    directory.mkdir(parents=True, exist_ok=True)
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(str(uploaded.name or "upload")).name).strip("._")
+    if not safe_name:
+        safe_name = "upload"
+    timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    target = directory / f"{timestamp}_{prefix}_{safe_name}"
+    if target.exists():
+        target = directory / f"{timestamp}_{prefix}_{uuid.uuid4().hex[:6]}_{safe_name}"
+    target.write_bytes(content)
+    return content, target
+
+
+def render_sku_upload_panel(conn, *, key_prefix: str, default_source: str = "manual") -> None:
+    upload_cols = st.columns([1.45, 0.85, 1.0])
+    uploaded = upload_cols[0].file_uploader("上传货号 Excel / CSV", type=["xlsx", "csv"], key=f"{key_prefix}_sku_upload")
+    source_name = upload_cols[1].text_input("来源名称", value=default_source, key=f"{key_prefix}_sku_source")
+    if uploaded is not None and upload_cols[2].button("导入货号清单", type="primary", use_container_width=True, key=f"{key_prefix}_sku_import"):
+        content, saved_path = _save_uploaded_file_copy(uploaded, SKU_UPLOAD_DIR, prefix="sku")
+        result = import_sku_file(conn, file_name=uploaded.name, content=content, source_name=source_name or "manual")
+        conn.commit()
+        bump_data_cache_version()
+        st.session_state["sync_notice"] = (
+            f"导入完成：识别 {result.rows_imported}/{result.rows_seen} 行；"
+            f"sheet：{', '.join(result.sheet_names)}；源文件已保存到 {_path_display(saved_path)}。"
+        )
+        st.rerun()
+
+    recent_uploads = sorted(SKU_UPLOAD_DIR.glob("*"), key=lambda p: p.stat().st_mtime, reverse=True)[:5] if SKU_UPLOAD_DIR.exists() else []
+    if recent_uploads:
+        st.caption("最近保存的上传源文件：" + "；".join(_path_display(path) for path in recent_uploads))
+
+
 def _save_env_file(values: dict[str, Any]) -> None:
     existing_lines = ENV_PATH.read_text(encoding="utf-8").splitlines() if ENV_PATH.exists() else []
     updated = {key: "" if values.get(key) is None else str(values.get(key)).strip() for key in ENV_KEYS}
@@ -5105,6 +5140,9 @@ def page_opportunities(conn, settings) -> None:
         f"已评分 {scored_styles} 个货号 / {scored_count} 个 US 尺码；缺发售日期 {missing_release_count} 个；"
         f"待补跑 {len(incomplete_styles)} 个。"
     )
+    with st.expander("导入货号 / GOAT热销榜（上传入口）", expanded=True):
+        render_sku_upload_panel(conn, key_prefix="opportunity", default_source="manual")
+
     auto_status = _render_auto_hourly_status(settings)
 
     sync_state = _sync_state_snapshot()
@@ -5862,14 +5900,7 @@ def page_import_sync(conn, settings) -> None:
     st.caption("支持 CSV / XLSX，多 sheet 会自动读取；STYLE NO 列会作为正确货号优先使用，尺码统一按 US。")
     render_live_sync_monitor()
 
-    uploaded = st.file_uploader("上传 Excel 或 CSV", type=["xlsx", "csv"])
-    source_name = st.text_input("来源名称", value="manual")
-    if uploaded is not None and st.button("导入货号清单", type="primary", use_container_width=True):
-        result = import_sku_file(conn, file_name=uploaded.name, content=uploaded.getvalue(), source_name=source_name)
-        conn.commit()
-        bump_data_cache_version()
-        st.success(f"导入完成：识别 {result.rows_imported}/{result.rows_seen} 行，sheet：{', '.join(result.sheet_names)}")
-        st.rerun()
+    render_sku_upload_panel(conn, key_prefix="sku_import", default_source="manual")
 
     signature = db_signature(settings.db_path)
     imported_skus = load_skus_cached(str(settings.db_path), signature)
