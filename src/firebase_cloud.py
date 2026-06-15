@@ -183,10 +183,11 @@ def backup_sqlite_to_firestore(db_path: Path | str, *, reason: str = "manual") -
     root = _backup_root(db, settings)
 
     old_chunks = list(root.collection("chunks").stream())
-    batch = db.batch()
-    for doc in old_chunks:
-        batch.delete(doc.reference)
-    batch.commit()
+    for start in range(0, len(old_chunks), 400):
+        batch = db.batch()
+        for doc in old_chunks[start : start + 400]:
+            batch.delete(doc.reference)
+        batch.commit()
 
     for start in range(0, len(chunks), 400):
         batch = db.batch()

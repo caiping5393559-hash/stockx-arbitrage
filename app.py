@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import hmac
@@ -542,6 +542,7 @@ ENV_KEYS = [
     "FIREBASE_PROJECT_ID",
     "FIREBASE_COLLECTION_PREFIX",
     "FIREBASE_SERVICE_ACCOUNT_B64",
+    "FIREBASE_SQLITE_BACKUP_MAX_MB",
     "FIREBASE_CREDENTIALS_PATH",
     "FIREBASE_SERVICE_ACCOUNT_JSON",
     "STOCKX_HOST",
@@ -4237,6 +4238,13 @@ def page_settings(settings) -> None:
                 value=settings.firebase_service_account_b64,
                 type="password",
             )
+            firebase_sqlite_backup_max_mb = st.number_input(
+                "SQLite云端备份上限MB（FIREBASE_SQLITE_BACKUP_MAX_MB）",
+                min_value=50.0,
+                max_value=5000.0,
+                value=float(settings.firebase_sqlite_backup_max_mb),
+                step=50.0,
+            )
         submitted = st.form_submit_button("保存到 .env", use_container_width=True)
 
     if submitted:
@@ -4251,6 +4259,7 @@ def page_settings(settings) -> None:
                 "FIREBASE_PROJECT_ID": firebase_project_id.strip(),
                 "FIREBASE_COLLECTION_PREFIX": firebase_collection_prefix.strip(),
                 "FIREBASE_SERVICE_ACCOUNT_B64": firebase_service_account_b64.strip(),
+                "FIREBASE_SQLITE_BACKUP_MAX_MB": firebase_sqlite_backup_max_mb,
                 "FIREBASE_CREDENTIALS_PATH": settings.firebase_credentials_path,
                 "FIREBASE_SERVICE_ACCOUNT_JSON": settings.firebase_service_account_json,
                 "STOCKX_TOKEN": token,
