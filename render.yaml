@@ -5,10 +5,6 @@ services:
     plan: free
     autoDeploy: false
     healthCheckPath: /_stcore/health
-    disk:
-      name: stockx-goat-data
-      mountPath: /app/data
-      sizeGB: 10
     envVars:
       - key: APP_LOGIN_ENABLED
         value: "true"
