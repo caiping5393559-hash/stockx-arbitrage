@@ -3459,19 +3459,32 @@ def _save_uploaded_file_copy(uploaded: Any, directory: Path, *, prefix: str) -> 
 
 def render_sku_upload_panel(conn, *, key_prefix: str, default_source: str = "manual") -> None:
     upload_cols = st.columns([1.45, 0.85, 1.0])
-    uploaded = upload_cols[0].file_uploader("上传货号 Excel / CSV", type=["xlsx", "csv"], key=f"{key_prefix}_sku_upload")
+    uploaded = upload_cols[0].file_uploader("上传货号 Excel / CSV", type=["xlsx", "xls", "csv"], key=f"{key_prefix}_sku_upload")
     source_name = upload_cols[1].text_input("来源名称", value=default_source, key=f"{key_prefix}_sku_source")
     if uploaded is not None and upload_cols[2].button("导入货号清单", type="primary", use_container_width=True, key=f"{key_prefix}_sku_import"):
-        content, saved_path = _save_uploaded_file_copy(uploaded, SKU_UPLOAD_DIR, prefix="sku")
-        result = import_sku_file(conn, file_name=uploaded.name, content=content, source_name=source_name or "manual")
-        conn.commit()
-        bump_data_cache_version()
-        schedule_cloud_backup("sku_import")
-        st.session_state["sync_notice"] = (
-            f"导入完成：识别 {result.rows_imported}/{result.rows_seen} 行；"
-            f"sheet：{', '.join(result.sheet_names)}；源文件已保存到 {_path_display(saved_path)}。"
-        )
-        st.rerun()
+        try:
+            content, saved_path = _save_uploaded_file_copy(uploaded, SKU_UPLOAD_DIR, prefix="sku")
+            result = import_sku_file(conn, file_name=uploaded.name, content=content, source_name=source_name or "manual")
+            conn.commit()
+            bump_data_cache_version()
+            schedule_cloud_backup("sku_import")
+            st.session_state["sync_notice"] = (
+                f"导入完成：识别 {result.rows_imported}/{result.rows_seen} 行；"
+                f"sheet：{', '.join(result.sheet_names)}；源文件已保存到 {_path_display(saved_path)}。"
+            )
+            st.rerun()
+        except Exception as exc:
+            conn.rollback()
+            log_sync(
+                conn,
+                f"货号清单导入失败：{exc}",
+                event_type="sku_import_error",
+                severity="error",
+                details={"file_name": getattr(uploaded, "name", ""), "source_name": source_name or "manual"},
+            )
+            conn.commit()
+            st.error(f"导入失败：{exc}")
+            st.info("请确认表格里有货号/款号/SKU/style/style number/product sku 等字段，或其中一列主要内容就是货号。")
 
     recent_uploads = sorted(SKU_UPLOAD_DIR.glob("*"), key=lambda p: p.stat().st_mtime, reverse=True)[:5] if SKU_UPLOAD_DIR.exists() else []
     if recent_uploads:

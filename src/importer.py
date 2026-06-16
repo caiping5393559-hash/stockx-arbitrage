@@ -307,9 +307,17 @@ def _find_reference_price(row: pd.Series) -> tuple[float | None, str | None]:
 def _dataframes_from_upload(file_name: str, content: bytes) -> dict[str, pd.DataFrame]:
     lower_name = file_name.lower()
     if lower_name.endswith(".csv"):
-        raw = pd.read_csv(io.BytesIO(content), header=None)
+        last_error: Exception | None = None
+        for encoding in ("utf-8-sig", "utf-8", "gb18030", "gbk", None):
+            try:
+                raw = pd.read_csv(io.BytesIO(content), header=None, encoding=encoding)
+                break
+            except UnicodeDecodeError as exc:
+                last_error = exc
+        else:
+            raise last_error or ValueError("CSV 文件编码无法识别")
         return {"CSV": _frame_from_raw_table(raw)}
-    if lower_name.endswith(".xlsx"):
+    if lower_name.endswith((".xlsx", ".xls")):
         sheets = pd.read_excel(io.BytesIO(content), sheet_name=None, header=None)
         return {str(name): _frame_from_raw_table(frame) for name, frame in sheets.items()}
     raise ValueError("仅支持 .csv 或 .xlsx 文件")
