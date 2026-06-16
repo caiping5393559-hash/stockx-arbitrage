@@ -42,6 +42,38 @@ STYLE_COLUMN_CANDIDATES = (
     "product sku",
 )
 
+STYLE_COLUMN_CANDIDATES = (
+    "货号",
+    "款号",
+    "商品货号",
+    "商品款号",
+    "货品货号",
+    "产品货号",
+    "鞋款货号",
+    "sku",
+    "product sku",
+    "product_sku",
+    "product-sku",
+    "merchant sku",
+    "merchantsku",
+    "item sku",
+    "itemsku",
+    "model",
+    "model no",
+    "model number",
+    "style",
+    "style no",
+    "style-no",
+    "style number",
+    "style code",
+    "stylecode",
+    "styleid",
+    "style id",
+    "style_no",
+    "styleno",
+    *STYLE_COLUMN_CANDIDATES,
+)
+
 REFERENCE_PRICE_HINTS = (
     "goat",
     "market",
@@ -61,6 +93,13 @@ RANK_COLUMN_CANDIDATES = (
     "排名",
 )
 
+RANK_COLUMN_CANDIDATES = (
+    "排名",
+    "排行",
+    "榜单排名",
+    *RANK_COLUMN_CANDIDATES,
+)
+
 TITLE_COLUMN_CANDIDATES = (
     "title",
     "name",
@@ -68,6 +107,14 @@ TITLE_COLUMN_CANDIDATES = (
     "product name",
     "商品名",
     "名称",
+)
+
+TITLE_COLUMN_CANDIDATES = (
+    "商品名",
+    "商品名称",
+    "名称",
+    "标题",
+    *TITLE_COLUMN_CANDIDATES,
 )
 
 
@@ -80,16 +127,68 @@ class ImportResult:
 
 
 def normalize_column(name: Any) -> str:
-    return re.sub(r"[\s_\-./]+", "", str(name).strip().lower())
+    return re.sub(r"[\s_\-./()（）:：#]+", "", str(name).strip().lower())
+
+
+def _header_aliases(candidates: tuple[str, ...]) -> set[str]:
+    return {normalize_column(candidate) for candidate in candidates}
 
 
 def _find_column(columns: list[Any], candidates: tuple[str, ...]) -> Any | None:
     normalized_columns = {normalize_column(column): column for column in columns}
-    for candidate in candidates:
-        normalized_candidate = normalize_column(candidate)
+    aliases = _header_aliases(candidates)
+    for normalized_candidate in aliases:
         if normalized_candidate in normalized_columns:
             return normalized_columns[normalized_candidate]
+    for normalized_column, column in normalized_columns.items():
+        if any(alias and alias in normalized_column for alias in aliases if len(alias) >= 4):
+            return column
     return None
+
+
+def _make_unique_columns(values: list[Any]) -> list[str]:
+    counts: dict[str, int] = {}
+    columns: list[str] = []
+    for index, value in enumerate(values):
+        base = str(value or "").strip() or f"column_{index + 1}"
+        count = counts.get(base, 0)
+        counts[base] = count + 1
+        columns.append(base if count == 0 else f"{base}_{count + 1}")
+    return columns
+
+
+def _sku_header_score(values: list[Any]) -> int:
+    aliases = set()
+    for candidates in (STYLE_COLUMN_CANDIDATES, RANK_COLUMN_CANDIDATES, TITLE_COLUMN_CANDIDATES):
+        aliases.update(_header_aliases(candidates))
+    score = 0
+    for value in values:
+        key = normalize_column(value)
+        if key in aliases:
+            score += 3
+        elif any(alias and alias in key for alias in aliases if len(alias) >= 4):
+            score += 1
+    return score
+
+
+def _frame_from_raw_table(raw: pd.DataFrame) -> pd.DataFrame:
+    if raw.empty:
+        return raw
+    best_idx = 0
+    best_score = -1
+    for idx in range(min(len(raw), 25)):
+        values = [None if pd.isna(v) else v for v in raw.iloc[idx].tolist()]
+        score = _sku_header_score(values)
+        if score > best_score:
+            best_idx = idx
+            best_score = score
+    if best_score >= 2:
+        frame = raw.iloc[best_idx + 1 :].copy()
+        frame.columns = _make_unique_columns([None if pd.isna(v) else v for v in raw.iloc[best_idx].tolist()])
+        return frame.dropna(how="all").reset_index(drop=True)
+    raw = raw.copy()
+    raw.columns = _make_unique_columns(raw.columns.tolist())
+    return raw.dropna(how="all").reset_index(drop=True)
 
 
 def _clean_style(value: Any) -> str | None:
@@ -118,6 +217,29 @@ def _scan_row_for_style(row: pd.Series) -> str | None:
         if style_no:
             return style_no
     return None
+
+
+def _style_content_score(series: pd.Series) -> float:
+    values = [None if pd.isna(v) else v for v in series.head(300).tolist()]
+    nonempty = [v for v in values if v not in (None, "")]
+    if not nonempty:
+        return 0.0
+    hits = 0
+    for value in nonempty:
+        if _clean_style(value):
+            hits += 1
+    return hits / max(len(nonempty), 1)
+
+
+def _detect_style_column_by_content(frame: pd.DataFrame) -> Any | None:
+    best_column = None
+    best_score = 0.0
+    for column in frame.columns:
+        score = _style_content_score(frame[column])
+        if score > best_score:
+            best_score = score
+            best_column = column
+    return best_column if best_score >= 0.45 else None
 
 
 def _extract_style(text: str) -> str | None:
@@ -185,10 +307,11 @@ def _find_reference_price(row: pd.Series) -> tuple[float | None, str | None]:
 def _dataframes_from_upload(file_name: str, content: bytes) -> dict[str, pd.DataFrame]:
     lower_name = file_name.lower()
     if lower_name.endswith(".csv"):
-        return {"CSV": pd.read_csv(io.BytesIO(content))}
+        raw = pd.read_csv(io.BytesIO(content), header=None)
+        return {"CSV": _frame_from_raw_table(raw)}
     if lower_name.endswith(".xlsx"):
-        sheets = pd.read_excel(io.BytesIO(content), sheet_name=None)
-        return {str(name): frame for name, frame in sheets.items()}
+        sheets = pd.read_excel(io.BytesIO(content), sheet_name=None, header=None)
+        return {str(name): _frame_from_raw_table(frame) for name, frame in sheets.items()}
     raise ValueError("仅支持 .csv 或 .xlsx 文件")
 
 
@@ -224,6 +347,8 @@ def import_sku_file(
         )
 
         style_col = _find_column(list(clean_frame.columns), STYLE_COLUMN_CANDIDATES)
+        if style_col is None:
+            style_col = _detect_style_column_by_content(clean_frame)
         rank_col = _find_column(list(clean_frame.columns), RANK_COLUMN_CANDIDATES)
         title_col = _find_column(list(clean_frame.columns), TITLE_COLUMN_CANDIDATES)
 
