@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import get_settings
-from .db import utc_now
+from .db import init_db, utc_now
 
 
 def _firebase_modules():
@@ -101,6 +101,193 @@ def write_cloud_event(event_type: str, payload: dict[str, Any]) -> None:
 
 def _backup_root(db, settings):
     return db.collection(settings.firebase_collection_prefix).document("sqlite_backup")
+
+
+def _core_backup_root(db, settings):
+    return db.collection(settings.firebase_collection_prefix).document("core_backup")
+
+
+CORE_BACKUP_TABLES = (
+    "sku_imports",
+    "sku_import_sheets",
+    "sku_items",
+    "products",
+    "opportunity_scores",
+    "opportunity_import_snapshots",
+    "opportunity_score_history",
+    "goat_consignment_items",
+    "goat_consignment_scores",
+    "goat_consignment_import_history",
+    "goat_consignment_history_items",
+    "goat_consignment_history_scores",
+    "goat_hidden_styles",
+)
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    ).fetchone()
+    return bool(row)
+
+
+def _read_table_rows(conn: sqlite3.Connection, table: str) -> list[dict[str, Any]]:
+    if not _table_exists(conn, table):
+        return []
+    rows = conn.execute(f"SELECT * FROM {table}").fetchall()
+    return [dict(row) for row in rows]
+
+
+def _replace_table_rows(conn: sqlite3.Connection, table: str, rows: list[dict[str, Any]]) -> None:
+    if not rows or not _table_exists(conn, table):
+        return
+    columns = [str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+    valid_rows = [{key: value for key, value in row.items() if key in columns} for row in rows]
+    valid_rows = [row for row in valid_rows if row]
+    if not valid_rows:
+        return
+    conn.execute(f"DELETE FROM {table}")
+    for row in valid_rows:
+        keys = list(row.keys())
+        placeholders = ",".join("?" for _ in keys)
+        quoted = ",".join(keys)
+        conn.execute(
+            f"INSERT OR REPLACE INTO {table} ({quoted}) VALUES ({placeholders})",
+            [row[key] for key in keys],
+        )
+
+
+def _write_chunked_payload(root, db, payload: dict[str, Any], meta_extra: dict[str, Any]) -> dict[str, Any]:
+    raw = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+    compressed = gzip.compress(raw, compresslevel=6)
+    encoded = base64.b64encode(compressed).decode("ascii")
+    chunk_size = 650_000
+    chunks = [encoded[index : index + chunk_size] for index in range(0, len(encoded), chunk_size)]
+
+    old_chunks = list(root.collection("chunks").stream())
+    for start in range(0, len(old_chunks), 400):
+        batch = db.batch()
+        for doc in old_chunks[start : start + 400]:
+            batch.delete(doc.reference)
+        batch.commit()
+
+    for start in range(0, len(chunks), 400):
+        batch = db.batch()
+        for index, chunk in enumerate(chunks[start : start + 400], start=start):
+            batch.set(root.collection("chunks").document(f"{index:06d}"), {"index": index, "data": chunk})
+        batch.commit()
+
+    meta = {
+        "updated_at": utc_now(),
+        "raw_size": len(raw),
+        "compressed_size": len(compressed),
+        "encoded_size": len(encoded),
+        "chunk_count": len(chunks),
+        **meta_extra,
+    }
+    root.set(meta)
+    return meta
+
+
+def _read_chunked_payload(root) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    meta = root.get()
+    if not meta.exists:
+        return None, {}
+    meta_data = meta.to_dict() or {}
+    chunk_count = int(meta_data.get("chunk_count") or 0)
+    if chunk_count <= 0:
+        return None, meta_data
+    encoded_parts: list[str] = []
+    for doc in root.collection("chunks").order_by("index").stream():
+        data = doc.to_dict() or {}
+        encoded = data.get("data")
+        if encoded:
+            encoded_parts.append(str(encoded))
+    if len(encoded_parts) != chunk_count:
+        return None, meta_data
+    compressed = base64.b64decode("".join(encoded_parts))
+    raw = gzip.decompress(compressed)
+    return json.loads(raw.decode("utf-8")), meta_data
+
+
+def backup_core_tables_to_firestore(db_path: Path | str, *, reason: str = "manual") -> dict[str, Any]:
+    settings = get_settings()
+    if not settings.firebase_enabled:
+        return {"ok": False, "message": "Firebase disabled"}
+    path = Path(db_path)
+    if not path.exists():
+        return {"ok": False, "message": f"SQLite file not found: {path}"}
+    db = firestore_client()
+    if db is None:
+        return {"ok": False, "message": "Firestore client not initialized"}
+
+    conn = sqlite3.connect(path, timeout=60)
+    conn.row_factory = sqlite3.Row
+    try:
+        tables = {table: _read_table_rows(conn, table) for table in CORE_BACKUP_TABLES}
+    finally:
+        conn.close()
+
+    row_counts = {table: len(rows) for table, rows in tables.items()}
+    payload = {"schema": 1, "tables": tables, "row_counts": row_counts}
+    meta = _write_chunked_payload(
+        _core_backup_root(db, settings),
+        db,
+        payload,
+        {"reason": reason, "row_counts": row_counts},
+    )
+    write_cloud_event("core_backup_saved", meta)
+    return {"ok": True, **meta}
+
+
+def restore_core_tables_if_needed(db_path: Path | str) -> bool:
+    settings = get_settings()
+    if not settings.firebase_enabled:
+        return False
+    path = Path(db_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    conn = sqlite3.connect(path, timeout=60)
+    conn.row_factory = sqlite3.Row
+    try:
+        init_db(conn)
+        existing_imports = conn.execute("SELECT COUNT(*) FROM sku_imports").fetchone()[0] or 0
+        existing_scores = conn.execute("SELECT COUNT(*) FROM opportunity_scores").fetchone()[0] or 0
+        existing_goat = conn.execute("SELECT COUNT(*) FROM goat_consignment_scores").fetchone()[0] or 0
+        if existing_imports or existing_scores or existing_goat:
+            return False
+    finally:
+        conn.close()
+
+    db = firestore_client()
+    if db is None:
+        return False
+    payload, meta_data = _read_chunked_payload(_core_backup_root(db, settings))
+    if not payload:
+        return False
+    tables = payload.get("tables") or {}
+
+    conn = sqlite3.connect(path, timeout=60)
+    conn.row_factory = sqlite3.Row
+    try:
+        init_db(conn)
+        conn.execute("BEGIN")
+        for table in CORE_BACKUP_TABLES:
+            rows = tables.get(table) or []
+            if isinstance(rows, list):
+                _replace_table_rows(conn, table, rows)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    write_cloud_event(
+        "core_backup_restored",
+        {"db_path": str(path), "backup_updated_at": meta_data.get("updated_at")},
+    )
+    return True
 
 
 def restore_sqlite_backup_if_needed(db_path: Path | str) -> bool:

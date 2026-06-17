@@ -44,7 +44,13 @@ from src.analytics import (
 )
 from src.config import BASE_DIR, get_settings
 from src.db import connect, init_db, json_dumps, json_loads, log_sync, query_rows, upsert_reference_price
-from src.firebase_cloud import backup_sqlite_to_firestore, firebase_status, restore_sqlite_backup_if_needed
+from src.firebase_cloud import (
+    backup_core_tables_to_firestore,
+    backup_sqlite_to_firestore,
+    firebase_status,
+    restore_core_tables_if_needed,
+    restore_sqlite_backup_if_needed,
+)
 from src.importer import import_sku_file, list_imported_skus
 from src.portfolio import add_trade, portfolio_summary
 from src.parsing import extract_product, extract_product_uuid, extract_release_date, extract_size_variants, normalize_style_no
@@ -2795,7 +2801,11 @@ def schedule_cloud_backup(reason: str) -> None:
 
     def worker() -> None:
         try:
-            backup_sqlite_to_firestore(db_path, reason=reason)
+            sqlite_result = backup_sqlite_to_firestore(db_path, reason=reason)
+            if not sqlite_result.get("ok"):
+                backup_core_tables_to_firestore(db_path, reason=reason)
+            else:
+                backup_core_tables_to_firestore(db_path, reason=reason)
         except Exception as exc:  # noqa: BLE001
             try:
                 with connect(db_path) as conn:
@@ -7433,6 +7443,16 @@ def _login_storage_bridge(*, token: str | None = None, clear: bool = False) -> N
     )
 
 
+def _set_remember_login_query_token(token: str | None = None, *, clear: bool = False) -> None:
+    try:
+        if clear:
+            st.query_params.clear()
+        elif token:
+            st.query_params["remember_token"] = token
+    except Exception:
+        pass
+
+
 def _render_remember_login_probe() -> None:
     components.html(
         f"""
@@ -7469,7 +7489,7 @@ def _require_app_login(settings) -> bool:
 
     if _query_param_first("logout") == "1":
         st.session_state["app_authenticated"] = False
-        _login_storage_bridge(clear=True)
+        _set_remember_login_query_token(clear=True)
         st.info("已退出登录。")
         return False
 
@@ -7479,7 +7499,7 @@ def _require_app_login(settings) -> bool:
             st.session_state["app_authenticated"] = True
             return True
         st.session_state["app_authenticated"] = False
-        _login_storage_bridge(clear=True)
+        _set_remember_login_query_token(clear=True)
         st.error("免登录已过期，请重新登录。")
         return False
 
@@ -7529,9 +7549,9 @@ def _require_app_login(settings) -> bool:
         if username_ok and password_ok:
             st.session_state["app_authenticated"] = True
             if remember_me:
-                _login_storage_bridge(token=_make_remember_login_token(str(settings.app_username or ""), str(settings.app_password or "")))
-                st.success("已记住登录。")
-                return False
+                token = _make_remember_login_token(str(settings.app_username or ""), str(settings.app_password or ""))
+                _set_remember_login_query_token(token)
+                st.rerun()
             else:
                 st.rerun()
         else:
@@ -7541,12 +7561,13 @@ def _require_app_login(settings) -> bool:
 
 def main() -> None:
     settings = get_settings()
-    if not _require_app_login(settings):
-        return
     try:
         restore_sqlite_backup_if_needed(Path(settings.db_path))
+        restore_core_tables_if_needed(Path(settings.db_path))
     except Exception:
         pass
+    if not _require_app_login(settings):
+        return
     conn = get_conn()
     _refresh_cache_after_sync_if_needed()
     st.sidebar.title("套利扫描器")
