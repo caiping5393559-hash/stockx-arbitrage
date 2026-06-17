@@ -7268,17 +7268,24 @@ def _validate_remember_login_token(token: str, settings) -> bool:
 
 def _login_storage_bridge(*, token: str | None = None, clear: bool = False) -> None:
     token_json = json.dumps(token or "")
-    clear_js = "localStorage.removeItem(KEY);" if clear else ""
-    set_js = f"localStorage.setItem(KEY, {token_json});" if token else ""
+    clear_json = json.dumps(bool(clear))
     components.html(
         f"""
         <script>
         const KEY = {json.dumps(REMEMBER_LOGIN_KEY)};
+        const TOKEN = {token_json};
+        const CLEAR = {clear_json};
         try {{
-          {clear_js}
-          {set_js}
           const target = window.parent || window;
-          target.location.href = target.location.pathname;
+          const url = new URL(target.location.href);
+          url.search = "";
+          if (CLEAR) {{
+            localStorage.removeItem(KEY);
+          }} else if (TOKEN) {{
+            localStorage.setItem(KEY, TOKEN);
+            url.searchParams.set("remember_token", TOKEN);
+          }}
+          target.location.href = url.toString();
         }} catch (err) {{}}
         </script>
         """,
@@ -7319,8 +7326,6 @@ def _require_app_login(settings) -> bool:
     if not settings.app_auth_ready:
         st.error("云端登录已开启，但 APP_PASSWORD 没有配置。请先在 .env / 服务器环境变量里设置 APP_USERNAME 和 APP_PASSWORD。")
         return False
-    if st.session_state.get("app_authenticated"):
-        return True
 
     if _query_param_first("logout") == "1":
         st.session_state["app_authenticated"] = False
@@ -7329,13 +7334,17 @@ def _require_app_login(settings) -> bool:
         return False
 
     remember_token = _query_param_first("remember_token")
-    if remember_token and _validate_remember_login_token(remember_token, settings):
-        st.session_state["app_authenticated"] = True
-        try:
-            st.query_params.clear()
-        except Exception:
-            pass
-        st.rerun()
+    if remember_token:
+        if _validate_remember_login_token(remember_token, settings):
+            st.session_state["app_authenticated"] = True
+            return True
+        st.session_state["app_authenticated"] = False
+        _login_storage_bridge(clear=True)
+        st.error("免登录已过期，请重新登录。")
+        return False
+
+    if st.session_state.get("app_authenticated"):
+        return True
 
     _render_remember_login_probe()
 
