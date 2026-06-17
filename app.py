@@ -291,6 +291,23 @@ st.markdown(
         padding: 12px 14px;
         margin: 10px 0 12px;
     }
+    .ui-toolbar {
+        background: #ffffff;
+        border: 1px solid #d9dee7;
+        border-radius: 8px;
+        padding: 12px 14px;
+        margin: 10px 0 12px;
+    }
+    .ui-toolbar .stButton button,
+    .ui-toolbar [data-testid="stButton"] button,
+    .ui-toolbar [data-testid="stFormSubmitButton"] button {
+        min-height: 42px !important;
+    }
+    .ui-compact-note {
+        color: #64748b !important;
+        font-size: 12px;
+        line-height: 1.35;
+    }
     .ui-section-title {
         color: #0f172a !important;
         font-size: 16px;
@@ -5995,14 +6012,6 @@ def page_opportunities(conn, settings) -> None:
         st.session_state["sync_notice"] = "已自动开始补齐发售日期并重算。" if job_id else "当前已有任务在运行。"
         st.rerun()
 
-    controls = st.columns([1, 1, 2])
-    with controls[0]:
-        show_all = st.toggle("显示全部等级", value=False)
-    with controls[1]:
-        include_young = st.toggle("包含发售不足90天", value=True)
-    with controls[2]:
-        st.caption("输入货号/尺码时会自动放开等级过滤。")
-
     sort_options = {
         "预计卖完天数（少到多）": ("estimated_days_to_sell", False),
         "每双利润（高到低）": ("estimated_profit_per_pair", True),
@@ -6014,7 +6023,31 @@ def page_opportunities(conn, settings) -> None:
     _ensure_opportunity_search_defaults(sort_options)
 
     history = _read_opportunity_search_history()
-    history_cols = st.columns([1.8, 0.8, 0.8, 2.6])
+    mode_cols = st.columns([1.25, 1.35, 1.55, 1.2])
+    with mode_cols[0]:
+        rating_scope = st.selectbox(
+            "等级范围",
+            ["只看可买等级", "显示全部等级"],
+            index=1 if bool(st.session_state.get("opp_show_all_scope", False)) else 0,
+            key="opp_rating_scope_select",
+        )
+        show_all = rating_scope == "显示全部等级"
+        st.session_state["opp_show_all_scope"] = show_all
+    with mode_cols[1]:
+        release_scope = st.selectbox(
+            "发售时间",
+            ["包含发售不足90天", "排除发售不足90天"],
+            index=0 if bool(st.session_state.get("opp_include_young_scope", True)) else 1,
+            key="opp_release_scope_select",
+        )
+        include_young = release_scope == "包含发售不足90天"
+        st.session_state["opp_include_young_scope"] = include_young
+    mode_cols[2].caption("输入货号/尺码时会自动放开等级过滤。")
+    if mode_cols[3].button("清空条件", use_container_width=True):
+        _reset_opportunity_search_state()
+        st.rerun()
+
+    history_cols = st.columns([2.4, 0.9, 3.2])
     if history:
         history_options = {
             f"{index + 1}. {_opportunity_history_label(item)}": item
@@ -6026,13 +6059,10 @@ def page_opportunities(conn, settings) -> None:
             st.rerun()
     else:
         history_cols[0].caption("历史查询：暂无")
-    if history_cols[2].button("清空条件", use_container_width=True):
-        _reset_opportunity_search_state()
-        st.rerun()
-    history_cols[3].caption("清空后恢复首页默认：最高买价 300 美金以下，按预计卖完天数少到多。")
+    history_cols[2].caption("清空后恢复首页默认：最高买价 300 美金以下，按预计卖完天数少到多。")
 
     with st.form("opportunity_search_form", clear_on_submit=False):
-        filter_cols = st.columns([1.2, 0.8, 0.9, 0.9, 0.8, 0.8, 0.8, 0.8])
+        filter_cols = st.columns([1.25, 0.75, 0.9, 0.9, 0.8, 0.75, 0.8, 0.75])
         filter_style_text = filter_cols[0].text_input("货号", placeholder="例如 HQ6998-200", key="opp_filter_style").strip()
         filter_size_text = normalize_us_size(
             filter_cols[1].text_input("US尺码", placeholder="例如 11", key="opp_filter_size").strip()
@@ -6049,7 +6079,7 @@ def page_opportunities(conn, settings) -> None:
         sell_days_value = optional_float(
             filter_cols[7].text_input("天数", placeholder="例如 21", key="sell_days_filter_value")
         )
-        sort_cols = st.columns([2, 0.8])
+        sort_cols = st.columns([3, 1.2])
         sort_label = sort_cols[0].selectbox("排序依据", list(sort_options.keys()), index=0, key="opp_sort_label")
         search_submitted = sort_cols[1].form_submit_button("确定查询", use_container_width=True)
 
