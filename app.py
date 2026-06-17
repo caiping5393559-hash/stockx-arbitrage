@@ -5896,6 +5896,11 @@ def page_opportunities(conn, settings) -> None:
         ]
     )
 
+    sync_state = _sync_state_snapshot()
+    auto_status = _auto_hourly_status_snapshot(settings)
+    job_running = sync_state.get("status") == "running" or bool(auto_status.get("running"))
+    _frontend_auto_refresh(job_running, interval_seconds=8, key="opportunity_progress")
+
     setup_tabs = st.tabs(["当前源文件 / 上传", "任务 / 数据维护", "历史结果"])
     with setup_tabs[0]:
         _ui_section_label(
@@ -5903,48 +5908,22 @@ def page_opportunities(conn, settings) -> None:
             "支持 CSV / Excel / ZIP。新上传会归档旧源文件结果；当前源文件才会继续自动刷新。",
         )
         render_sku_upload_panel(conn, key_prefix="opportunity", default_source="manual")
-    with setup_tabs[2]:
-        render_opportunity_snapshot_history(conn, settings)
-
     with setup_tabs[1]:
         auto_status = _render_auto_hourly_status(settings)
+        run_counts = _current_sync_run_counts(conn, sync_state, imported_scope_sql)
+        if run_counts:
+            st.info(
+                "本轮进度说明："
+                f"已处理 {run_counts['completed']} 个货号；"
+                f"其中 {run_counts['with_product']} 个已经有商品主数据；"
+                f"{run_counts['with_score']} 个已经生成评分。"
+                "上面的“已接入”只统计商品主数据总数，不等于本轮已处理数。"
+            )
         st.caption(f"缺发售日期 {missing_release_count} 个；继续补跑只处理未完整接入或未评分货号。")
-
-    sync_state = _sync_state_snapshot()
-    job_running = sync_state.get("status") == "running" or bool(auto_status.get("running"))
-    run_counts = _current_sync_run_counts(conn, sync_state, imported_scope_sql)
-    if run_counts:
-        st.info(
-            "本轮进度说明："
-            f"已处理 {run_counts['completed']} 个货号；"
-            f"其中 {run_counts['with_product']} 个已经有商品主数据；"
-            f"{run_counts['with_score']} 个已经生成评分。"
-            "上面的“已接入”只统计商品主数据总数，不等于本轮已处理数。"
-        )
-    _frontend_auto_refresh(job_running, interval_seconds=8, key="opportunity_progress")
-    refresh_cols = st.columns([1.45, 1.35, 1, 1.7])
-    if refresh_cols[0].button("继续补跑未完成货号", type="primary", use_container_width=True, disabled=job_running or not incomplete_styles):
-        job_id = start_sync_job(
-            incomplete_styles,
-            db_path_str=str(settings.db_path),
-            include_sales=True,
-            include_depth=True,
-            include_size_endpoints=True,
-            parallel_sync=True,
-            max_workers=settings.sync_max_workers,
-            fee_rate=settings.estimated_seller_fee_rate,
-            sales_fraction=settings.buy_depth_sales_fraction,
-            reset_snapshot=False,
-        )
-        st.session_state["sync_notice"] = (
-            f"已开始继续补跑 {len(incomplete_styles)} 个未完成货号；已有快照不会被清空。"
-            if job_id else "当前已有任务在运行。"
-        )
-        st.rerun()
-    if refresh_cols[1].button("全量刷新StockX API并重算", use_container_width=True, disabled=job_running):
-        if imported_styles:
+        refresh_cols = st.columns([1.45, 1.35, 1, 1.7])
+        if refresh_cols[0].button("继续补跑未完成货号", type="primary", use_container_width=True, disabled=job_running or not incomplete_styles):
             job_id = start_sync_job(
-                imported_styles,
+                incomplete_styles,
                 db_path_str=str(settings.db_path),
                 include_sales=True,
                 include_depth=True,
@@ -5953,28 +5932,47 @@ def page_opportunities(conn, settings) -> None:
                 max_workers=settings.sync_max_workers,
                 fee_rate=settings.estimated_seller_fee_rate,
                 sales_fraction=settings.buy_depth_sales_fraction,
-                reset_snapshot=True,
+                reset_snapshot=False,
             )
             st.session_state["sync_notice"] = (
-                f"已开始全量刷新 StockX API：{len(imported_styles)} 个货号；旧Ask/Bid/成交/市场快照已按货号清理。"
+                f"已开始继续补跑 {len(incomplete_styles)} 个未完成货号；已有快照不会被清空。"
                 if job_id else "当前已有任务在运行。"
             )
             st.rerun()
-        else:
-            st.warning("还没有导入 StockX 货号。")
-    if refresh_cols[2].button("仅重算评分（本地快照）", use_container_width=True, disabled=job_running):
-        job_id = start_recompute_job(
-            db_path_str=str(settings.db_path),
-            fee_rate=settings.estimated_seller_fee_rate,
-            sales_fraction=settings.buy_depth_sales_fraction,
-        )
-        st.session_state["sync_notice"] = "已开始按本地快照重算评分；不会请求StockX接口。" if job_id else "当前已有任务在运行。"
-        st.rerun()
-    refresh_cols[3].caption("继续补跑只处理缺商品、缺尺码、缺Ask、缺成交或缺评分的货号；全量刷新会清旧快照后重跑全部。")
+        if refresh_cols[1].button("全量刷新StockX API并重算", use_container_width=True, disabled=job_running):
+            if imported_styles:
+                job_id = start_sync_job(
+                    imported_styles,
+                    db_path_str=str(settings.db_path),
+                    include_sales=True,
+                    include_depth=True,
+                    include_size_endpoints=True,
+                    parallel_sync=True,
+                    max_workers=settings.sync_max_workers,
+                    fee_rate=settings.estimated_seller_fee_rate,
+                    sales_fraction=settings.buy_depth_sales_fraction,
+                    reset_snapshot=True,
+                )
+                st.session_state["sync_notice"] = (
+                    f"已开始全量刷新 StockX API：{len(imported_styles)} 个货号；旧Ask/Bid/成交/市场快照已按货号清理。"
+                    if job_id else "当前已有任务在运行。"
+                )
+                st.rerun()
+            else:
+                st.warning("还没有导入 StockX 货号。")
+        if refresh_cols[2].button("仅重算评分（本地快照）", use_container_width=True, disabled=job_running):
+            job_id = start_recompute_job(
+                db_path_str=str(settings.db_path),
+                fee_rate=settings.estimated_seller_fee_rate,
+                sales_fraction=settings.buy_depth_sales_fraction,
+            )
+            st.session_state["sync_notice"] = "已开始按本地快照重算评分；不会请求StockX接口。" if job_id else "当前已有任务在运行。"
+            st.rerun()
+        refresh_cols[3].caption("继续补跑只处理缺商品、缺尺码、缺Ask、缺成交或缺评分的货号；全量刷新会清旧快照后重跑全部。")
+        render_live_sync_monitor()
+    with setup_tabs[2]:
+        render_opportunity_snapshot_history(conn, settings)
 
-    render_live_sync_monitor()
-
-    _ui_section_label("筛选和结果", "首页默认显示最高买价 300 美金以内，并按预计卖完天数从少到多排序。")
     if AUTO_FULL_REFRESH_FLAG.exists() and sync_state.get("status") != "running" and imported_styles:
         try:
             AUTO_FULL_REFRESH_FLAG.unlink()
@@ -6011,6 +6009,8 @@ def page_opportunities(conn, settings) -> None:
         )
         st.session_state["sync_notice"] = "已自动开始补齐发售日期并重算。" if job_id else "当前已有任务在运行。"
         st.rerun()
+
+    _ui_section_label("筛选和结果", "首页默认显示最高买价 300 美金以内，并按预计卖完天数从少到多排序。")
 
     sort_options = {
         "预计卖完天数（少到多）": ("estimated_days_to_sell", False),
