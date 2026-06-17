@@ -3557,6 +3557,40 @@ def load_skus_cached(db_path_str: str, signature: tuple[int, int]) -> list[str]:
     return [str(row["style_no"]) for row in rows]
 
 
+def latest_stockx_import_scope(conn) -> tuple[int | None, int, list[str], str]:
+    row = conn.execute(
+        """
+        SELECT id, file_name
+        FROM sku_imports
+        WHERE source_name IN ('stockx_top1000', 'manual')
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    if not row:
+        return None, 0, [], "SELECT DISTINCT style_no FROM sku_items WHERE 1=0"
+    import_id = int(row["id"])
+    row_count = conn.execute("SELECT COUNT(*) FROM sku_items WHERE import_id = ?", (import_id,)).fetchone()[0] or 0
+    style_rows = query_rows(
+        conn,
+        """
+        SELECT DISTINCT style_no
+        FROM sku_items
+        WHERE import_id = ?
+          AND style_no IS NOT NULL
+          AND TRIM(style_no) != ''
+        ORDER BY style_no
+        """,
+        (import_id,),
+    )
+    styles = [str(item["style_no"]) for item in style_rows]
+    scope_sql = (
+        "SELECT DISTINCT style_no FROM sku_items "
+        f"WHERE import_id = {import_id} AND style_no IS NOT NULL AND TRIM(style_no) != ''"
+    )
+    return import_id, int(row_count), styles, scope_sql
+
+
 def load_incomplete_stockx_skus(conn) -> list[str]:
     rows = query_rows(
         conn,
@@ -5458,19 +5492,21 @@ def page_opportunities(conn, settings) -> None:
     _consume_row_refresh_query(settings)
 
     signature = db_signature(settings.db_path)
-    imported_styles = load_skus_cached(str(settings.db_path), signature)
+    active_import_id, imported_row_count, imported_styles, imported_scope_sql = latest_stockx_import_scope(conn)
     imported_count = len(imported_styles)
-    imported_scope_sql = "SELECT DISTINCT style_no FROM sku_items WHERE style_no IS NOT NULL AND TRIM(style_no) != ''"
     scored_count = conn.execute(f"SELECT COUNT(*) FROM opportunity_scores WHERE style_no IN ({imported_scope_sql})").fetchone()[0] or 0
     scored_styles = conn.execute(f"SELECT COUNT(DISTINCT style_no) FROM opportunity_scores WHERE style_no IN ({imported_scope_sql})").fetchone()[0] or 0
     product_styles = conn.execute(f"SELECT COUNT(DISTINCT style_no) FROM products WHERE style_no IN ({imported_scope_sql})").fetchone()[0] or 0
     missing_release_count = conn.execute(
         f"SELECT COUNT(*) FROM products WHERE style_no IN ({imported_scope_sql}) AND (release_date IS NULL OR TRIM(release_date) = '')"
     ).fetchone()[0] or 0
-    incomplete_styles = load_incomplete_stockx_skus(conn)
+    active_import_style_set = set(imported_styles)
+    incomplete_styles = [style for style in load_incomplete_stockx_skus(conn) if style in active_import_style_set]
 
     st.caption(
-        f"这里仅统计 StockX 导入清单：导入 {imported_count} 个货号；已接入商品主数据 {product_styles} 个；"
+        f"这里仅统计最新 StockX 导入批次"
+        f"{f' #{active_import_id}' if active_import_id else ''}：导入 {imported_row_count} 行 / 去重 {imported_count} 个货号；"
+        f"已接入商品主数据 {product_styles} 个；"
         f"已评分 {scored_styles} 个货号 / {scored_count} 个 US 尺码；缺发售日期 {missing_release_count} 个；"
         f"待补跑 {len(incomplete_styles)} 个。"
     )
@@ -7202,10 +7238,11 @@ def _require_app_login(settings) -> bool:
         """
         <style>
         div[data-testid="stAppViewContainer"] .main .block-container {
-            padding-top: 10vh;
+            padding-top: 6vh;
+            max-width: 760px;
         }
         div[data-testid="stForm"] {
-            padding: 1rem 1.1rem .85rem;
+            padding: .85rem 1rem .75rem;
             border: 1px solid #d9dee7;
             border-radius: 12px;
             background: #ffffff;
@@ -7226,7 +7263,7 @@ def _require_app_login(settings) -> bool:
     left, center, right = st.columns([1.15, 0.72, 1.15])
     with center:
         st.markdown("## 套利扫描器登录")
-        st.caption("登录后进入 StockX / GOAT 套利扫描器。")
+        st.caption("账号：admin；密码使用服务器环境变量 APP_PASSWORD。")
         with st.form("app_login_form"):
             username = st.text_input("账号")
             password = st.text_input("密码", type="password")

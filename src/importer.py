@@ -223,6 +223,15 @@ def _clean_style_from_named_column(value: Any) -> str | None:
     return _extract_style(text)
 
 
+def _clean_stockx_top1000_style(value: Any) -> str | None:
+    if value is None or pd.isna(value):
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "null"}:
+        return None
+    return normalize_style_no(text)
+
+
 def _scan_row_for_style(row: pd.Series) -> str | None:
     for value in row.tolist():
         if value is None or pd.isna(value):
@@ -331,6 +340,15 @@ def _stockx_top1000_reference_price(row: pd.Series) -> tuple[float | None, str |
 def _looks_like_stockx_top1000(frame: pd.DataFrame) -> bool:
     columns = {normalize_column(column) for column in frame.columns}
     return len(columns & STOCKX_TOP1000_MARKERS) >= 3
+
+
+def _stockx_top1000_style_column(frame: pd.DataFrame) -> Any | None:
+    normalized = {normalize_column(column): column for column in frame.columns}
+    for name in ("StyleID", "Style ID", "style_id", "styleid"):
+        column = normalized.get(normalize_column(name))
+        if column is not None:
+            return column
+    return None
 
 
 def _stockx_category_from_name(file_name: str, sheet_name: str) -> str | None:
@@ -457,19 +475,22 @@ def import_sku_file(
             (import_id, sheet_name, len(raw_rows), json_dumps(raw_rows)),
         )
 
-        style_col = _find_column(list(clean_frame.columns), STYLE_COLUMN_CANDIDATES)
-        if style_col is None:
-            style_col = _detect_style_column_by_content(clean_frame)
         rank_col = _find_column(list(clean_frame.columns), RANK_COLUMN_CANDIDATES)
         title_col = _find_column(list(clean_frame.columns), TITLE_COLUMN_CANDIDATES)
         is_stockx_top1000 = _looks_like_stockx_top1000(clean_frame)
+        if is_stockx_top1000:
+            style_col = _stockx_top1000_style_column(clean_frame)
+        else:
+            style_col = _find_column(list(clean_frame.columns), STYLE_COLUMN_CANDIDATES)
+            if style_col is None:
+                style_col = _detect_style_column_by_content(clean_frame)
         stockx_category = _stockx_category_from_name(file_name, sheet_name)
 
         for row_index, row in clean_frame.iterrows():
             if is_stockx_top1000:
                 if style_col is None:
                     continue
-                style_no = _clean_style_from_named_column(row.get(style_col))
+                style_no = _clean_stockx_top1000_style(row.get(style_col))
             elif style_col is not None:
                 style_no = _clean_style_from_named_column(row.get(style_col))
             else:
