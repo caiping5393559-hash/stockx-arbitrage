@@ -125,12 +125,14 @@ class StockXClient:
         params: dict[str, Any] | None = None,
         *,
         paginate: bool = True,
+        method: str = "GET",
     ) -> ApiCallResult:
         endpoint = endpoint if endpoint.startswith("/") else f"/{endpoint}"
         url = f"{self.settings.host}{endpoint}"
         base_params = dict(params or {})
         auth_present = bool(self.settings.token or self.settings.auth)
         errors: list[str] = []
+        request_method = method.upper()
 
         for mode in self._credential_modes():
             auth_params, headers = self._credentials_for_mode(mode)
@@ -149,7 +151,8 @@ class StockXClient:
                         "Pragma": "no-cache",
                         **headers,
                     }
-                    response = self.session.get(
+                    response = self.session.request(
+                        request_method,
                         url,
                         params=request_params,
                         headers=request_headers,
@@ -257,6 +260,37 @@ class StockXClient:
         if category:
             params["category"] = category
         return self.request("/search_product", params)
+
+    def search_advanced_v2(
+        self,
+        *,
+        category: str = "sneakers",
+        keyword: str | None = None,
+        page: int = 1,
+        country: str = "US",
+        currency_code: str = "USD",
+        brand: str | None = None,
+        gender: str | None = None,
+        lowest_ask_range: str | None = None,
+        sort: str = "deadstock_sold",
+        sort_order: str = "DESC",
+    ) -> ApiCallResult:
+        params: dict[str, Any] = {
+            "category": category,
+            "page": page,
+            "country": country,
+            "currency_code": currency_code,
+            "sort": sort,
+            "sort_order": sort_order,
+        }
+        optional = {
+            "keyword": keyword,
+            "brand": brand,
+            "gender": gender,
+            "lowest_ask_range": lowest_ask_range,
+        }
+        params.update({key: value for key, value in optional.items() if value not in (None, "")})
+        return self.request("/search_advanced_v2", params, method="POST")
 
     def product_detail(self, product_uuid: str | None = None, *, currency_code: str = "USD") -> ApiCallResult:
         return self.request("/product_detail", self._product_uuid_params(product_uuid, currency_code), paginate=False)
