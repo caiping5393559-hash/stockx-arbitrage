@@ -157,9 +157,33 @@ st.markdown(
     div[data-testid="stForm"] div[data-testid="stVerticalBlock"] {
         gap: 0.35rem !important;
     }
+    div[data-testid="stForm"] label,
+    div[data-testid="stForm"] label *,
+    div[data-testid="stForm"] [data-testid="stWidgetLabel"],
+    div[data-testid="stForm"] [data-testid="stWidgetLabel"] *,
+    div[data-testid="stForm"] [data-testid="stMarkdownContainer"],
+    div[data-testid="stForm"] [data-testid="stMarkdownContainer"] *,
+    div[data-testid="stForm"] [data-testid="stCaptionContainer"],
+    div[data-testid="stForm"] [data-testid="stCaptionContainer"] * {
+        color: #111827 !important;
+        -webkit-text-fill-color: #111827 !important;
+    }
     div[data-testid="stExpander"] {
         margin-top: 0.25rem !important;
         margin-bottom: 0.25rem !important;
+    }
+    div[data-testid="stExpander"] details,
+    div[data-testid="stExpander"] summary {
+        background: #ffffff !important;
+        color: #111827 !important;
+        border-radius: 8px !important;
+    }
+    div[data-testid="stExpander"] summary *,
+    div[data-baseweb="tab-list"] *,
+    button[role="tab"] *,
+    [role="tab"] * {
+        color: #111827 !important;
+        -webkit-text-fill-color: #111827 !important;
     }
     div[data-testid="stMetric"] {
         background: #ffffff;
@@ -475,6 +499,13 @@ st.markdown(
         -webkit-text-fill-color: #ffffff !important;
         border-radius: 8px !important;
         font-weight: 750 !important;
+    }
+    div[data-testid="stButton"] button:disabled,
+    div[data-testid="stFormSubmitButton"] button:disabled,
+    div[data-testid="stDownloadButton"] button:disabled {
+        background: #6b7280 !important;
+        border-color: #6b7280 !important;
+        opacity: 0.78 !important;
     }
     div[data-testid="stButton"] button *,
     div[data-testid="stFormSubmitButton"] button *,
@@ -5600,12 +5631,10 @@ def _ui_status_cards(items: list[tuple[str, Any]], *, max_cards: int = 6) -> Non
     html = []
     for label, value in items[:max_cards]:
         html.append(
-            f"""
-            <div class="ui-stat-card">
-              <div class="ui-stat-label">{escape(str(label))}</div>
-              <div class="ui-stat-value">{escape(str(value))}</div>
-            </div>
-            """
+            '<div class="ui-stat-card">'
+            f'<div class="ui-stat-label">{escape(str(label))}</div>'
+            f'<div class="ui-stat-value">{escape(str(value))}</div>'
+            "</div>"
         )
     st.markdown(f'<div class="ui-card-grid">{"".join(html)}</div>', unsafe_allow_html=True)
 
@@ -6063,7 +6092,9 @@ def page_opportunities(conn, settings) -> None:
         tuple(params),
     )
     if not export_rows:
+        st.radio("显示方式", ["卡片视图", "紧凑表格", "引用数据"], horizontal=True, disabled=True)
         st.info("暂无机会数据。先在「SKU 导入 / 同步」导入货号并同步接口。")
+        st.caption("卡片视角依赖 opportunity_scores 评分结果；当前筛选没有评分结果时，只能先看下面的导入货号覆盖情况。")
     else:
         export_frame = _opportunity_export_frame(export_rows)
         export_cols = st.columns([1.2, 4])
@@ -6229,7 +6260,7 @@ def page_opportunities(conn, settings) -> None:
                     "last_computed_at": "最近计算",
                 }
             )
-            st.dataframe(coverage_frame, use_container_width=True, height=320)
+            st.dataframe(coverage_frame, use_container_width=True, height=620)
         else:
             st.info("暂无导入货号。")
 
