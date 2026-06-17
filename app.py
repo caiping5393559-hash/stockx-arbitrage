@@ -203,6 +203,81 @@ st.markdown(
         border-radius: 8px;
         overflow: hidden;
     }
+    .ui-page-head {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 16px;
+        margin: 0.15rem 0 0.75rem;
+    }
+    .ui-page-title {
+        margin: 0;
+        color: #0f172a !important;
+        font-size: 32px;
+        font-weight: 850;
+        line-height: 1.1;
+    }
+    .ui-page-sub {
+        margin-top: 8px;
+        color: #64748b !important;
+        font-size: 14px;
+        line-height: 1.5;
+        max-width: 1180px;
+    }
+    .ui-pill {
+        flex: 0 0 auto;
+        border-radius: 999px;
+        padding: 7px 12px;
+        background: #e8f0ff;
+        color: #175cd3 !important;
+        font-size: 12px;
+        font-weight: 800;
+        border: 1px solid #c7d7fe;
+    }
+    .ui-card-grid {
+        display: grid;
+        grid-template-columns: repeat(5, minmax(140px, 1fr));
+        gap: 12px;
+        margin: 8px 0 12px;
+    }
+    .ui-stat-card {
+        background: #ffffff;
+        border: 1px solid #d9dee7;
+        border-radius: 8px;
+        padding: 12px 14px;
+        min-height: 86px;
+    }
+    .ui-stat-label {
+        color: #64748b !important;
+        font-size: 13px;
+        font-weight: 700;
+        margin-bottom: 8px;
+    }
+    .ui-stat-value {
+        color: #0f172a !important;
+        font-size: 28px;
+        font-weight: 850;
+        line-height: 1.05;
+        word-break: break-word;
+    }
+    .ui-section {
+        background: #ffffff;
+        border: 1px solid #d9dee7;
+        border-radius: 8px;
+        padding: 12px 14px;
+        margin: 10px 0 12px;
+    }
+    .ui-section-title {
+        color: #0f172a !important;
+        font-size: 16px;
+        font-weight: 820;
+        margin-bottom: 4px;
+    }
+    .ui-muted {
+        color: #64748b !important;
+        font-size: 13px;
+        line-height: 1.45;
+    }
     .opp-card {
         border: 1px solid rgba(255,255,255,0.12);
         background: #0f141b;
@@ -496,12 +571,15 @@ st.markdown(
         opacity: 1 !important;
     }
     @media (max-width: 1300px) {
+        .ui-card-grid { grid-template-columns: repeat(3, minmax(140px, 1fr)); }
         .opp-grid { grid-template-columns: repeat(3, minmax(150px, 1fr)); }
         .opp-price-grid { grid-template-columns: repeat(2, minmax(180px, 1fr)); }
         .opp-action-grid { grid-template-columns: 1fr; }
     }
     @media (max-width: 800px) {
         .main .block-container { padding-left: 1rem; padding-right: 1rem; }
+        .ui-page-head { flex-direction: column; }
+        .ui-card-grid { grid-template-columns: 1fr; }
         .opp-grid { grid-template-columns: 1fr; }
         .opp-wide { grid-column: span 1; }
         .opp-head { flex-direction: column; }
@@ -5499,6 +5577,47 @@ def _rating_class(rating: Any) -> str:
     return "rating-s"
 
 
+def _ui_page_header(title: str, subtitle: str = "", pill: str = "") -> None:
+    pill_html = f'<div class="ui-pill">{escape(pill)}</div>' if pill else ""
+    subtitle_html = f'<div class="ui-page-sub">{escape(subtitle)}</div>' if subtitle else ""
+    st.markdown(
+        f"""
+        <div class="ui-page-head">
+          <div>
+            <div class="ui-page-title">{escape(title)}</div>
+            {subtitle_html}
+          </div>
+          {pill_html}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _ui_status_cards(items: list[tuple[str, Any]], *, max_cards: int = 6) -> None:
+    if not items:
+        return
+    html = []
+    for label, value in items[:max_cards]:
+        html.append(
+            f"""
+            <div class="ui-stat-card">
+              <div class="ui-stat-label">{escape(str(label))}</div>
+              <div class="ui-stat-value">{escape(str(value))}</div>
+            </div>
+            """
+        )
+    st.markdown(f'<div class="ui-card-grid">{"".join(html)}</div>', unsafe_allow_html=True)
+
+
+def _ui_section_label(title: str, note: str = "") -> None:
+    note_html = f'<div class="ui-muted">{escape(note)}</div>' if note else ""
+    st.markdown(
+        f'<div class="ui-section-title">{escape(title)}</div>{note_html}',
+        unsafe_allow_html=True,
+    )
+
+
 def _html_cell(label: str, value: Any, *, wide: bool = False, extra_wide: bool = False, compact: bool = False) -> str:
     extra = " opp-extra-wide" if extra_wide else (" opp-wide" if wide else "")
     if compact:
@@ -5660,7 +5779,11 @@ def _render_opportunity_card(row: dict[str, Any], settings=None, *, refresh_disa
 
 
 def page_opportunities(conn, settings) -> None:
-    st.markdown("### 今日机会")
+    _ui_page_header(
+        "今日机会",
+        "当前页只处理 StockX 导入货号。当前批次会保留源文件和历史结果；只有当前源文件会参与自动刷新。",
+        "StockX机会",
+    )
     notice = st.session_state.pop("sync_notice", None)
     if notice:
         state = _sync_state_snapshot()
@@ -5682,19 +5805,30 @@ def page_opportunities(conn, settings) -> None:
     ).fetchone()[0] or 0
     active_import_style_set = set(imported_styles)
     incomplete_styles = [style for style in load_incomplete_stockx_skus(conn) if style in active_import_style_set]
-
-    st.caption(
-        f"这里仅统计最新 StockX 导入批次"
-        f"{f' #{active_import_id}' if active_import_id else ''}：导入 {imported_row_count} 行 / 去重 {imported_count} 个货号；"
-        f"已接入商品主数据 {product_styles} 个；"
-        f"已评分 {scored_styles} 个货号 / {scored_count} 个 US 尺码；缺发售日期 {missing_release_count} 个；"
-        f"待补跑 {len(incomplete_styles)} 个。"
+    _ui_status_cards(
+        [
+            ("当前批次", f"#{active_import_id}" if active_import_id else "-"),
+            ("导入行 / 货号", f"{imported_row_count} / {imported_count}"),
+            ("已接入商品", product_styles),
+            ("已评分货号", scored_styles),
+            ("已评分尺码", scored_count),
+            ("待补跑", len(incomplete_styles)),
+        ]
     )
-    with st.expander("导入货号 / GOAT热销榜（上传入口）", expanded=True):
-        render_sku_upload_panel(conn, key_prefix="opportunity", default_source="manual")
-    render_opportunity_snapshot_history(conn, settings)
 
-    auto_status = _render_auto_hourly_status(settings)
+    setup_tabs = st.tabs(["当前源文件 / 上传", "任务 / 数据维护", "历史结果"])
+    with setup_tabs[0]:
+        _ui_section_label(
+            "上传当前源文件",
+            "支持 CSV / Excel / ZIP。新上传会归档旧源文件结果；当前源文件才会继续自动刷新。",
+        )
+        render_sku_upload_panel(conn, key_prefix="opportunity", default_source="manual")
+    with setup_tabs[2]:
+        render_opportunity_snapshot_history(conn, settings)
+
+    with setup_tabs[1]:
+        auto_status = _render_auto_hourly_status(settings)
+        st.caption(f"缺发售日期 {missing_release_count} 个；继续补跑只处理未完整接入或未评分货号。")
 
     sync_state = _sync_state_snapshot()
     job_running = sync_state.get("status") == "running" or bool(auto_status.get("running"))
@@ -5760,6 +5894,7 @@ def page_opportunities(conn, settings) -> None:
 
     render_live_sync_monitor()
 
+    _ui_section_label("筛选和结果", "首页默认显示最高买价 300 美金以内，并按预计卖完天数从少到多排序。")
     if AUTO_FULL_REFRESH_FLAG.exists() and sync_state.get("status") != "running" and imported_styles:
         try:
             AUTO_FULL_REFRESH_FLAG.unlink()
@@ -6657,7 +6792,7 @@ def _page_goat_consignment_selection_legacy(conn, settings) -> None:
     st.dataframe(frame, use_container_width=True, height=720, hide_index=True)
 
 
-def page_goat_consignment_selection(conn, settings) -> None:
+def _legacy_page_goat_consignment_selection_unused(conn, settings) -> None:
     st.markdown("### GOAT寄存选品")
     st.caption("导入 GOAT 洛杉矶 S 仓寄存库存；购买成本 = GOAT价格 + 6 美元；StockX 出售回款按出售价扣 3%。")
 
@@ -6921,8 +7056,11 @@ def page_goat_consignment_selection(conn, settings) -> None:
 
 
 def page_goat_consignment_selection(conn, settings) -> None:
-    st.title("GOAT寄存选品")
-    st.caption("来源是 GOAT 洛杉矶 S 仓清单；购买成本 = GOAT价格 + 6 美元；StockX 出售回款按出售价扣 3%。StockX 最低Ask、7天均价、30天均价和售罄天数独立补数，不和262个StockX导入货号绑定。")
+    _ui_page_header(
+        "GOAT寄存选品",
+        "当前页只处理 GOAT寄存清单。采购成本 = GOAT价格 + 6 美元；StockX 出售回款按出售价扣 3%。补数任务独立运行，不和今日机会绑定。",
+        "GOAT寄存",
+    )
     _ensure_goat_hidden_styles_table(conn)
     _consume_goat_hidden_style_query(conn)
 
@@ -6964,6 +7102,7 @@ def page_goat_consignment_selection(conn, settings) -> None:
     job_running = worker_status == "running"
     _frontend_auto_refresh(job_running and worker_matches_current, interval_seconds=8, key="goat_stockx_progress")
 
+    _ui_section_label("当前清单和补数任务", "上传新清单会替换当前清单，并启动独立 StockX 补数任务；旧清单进入历史，不继续刷新。")
     upload_cols = st.columns([1.25, 0.9, 1.2])
     uploaded = upload_cols[0].file_uploader("上传GOAT寄存CSV/XLSX", type=["csv", "xlsx"], key="goat_consignment_upload_clean")
     source_name = upload_cols[1].text_input("批次名称", value="goat_slover")
@@ -7041,19 +7180,23 @@ def page_goat_consignment_selection(conn, settings) -> None:
           (SELECT COUNT(*) FROM goat_hidden_styles) AS hidden_styles
         """,
     )[0]
-    k1, k2, k3, k4, k5, k6 = st.columns(6)
-    k1.metric("GOAT行数", int(counts["items"] or 0))
-    k2.metric("已评分", int(counts["scored"] or 0))
-    k3.metric("本次已处理", int(worker_state.get("completed") or 0) if worker_matches_current else 0)
-    k4.metric("有StockX Ask", int(counts["with_ask"] or 0))
-    k5.metric("缺StockX Ask", int(counts["missing_ask"] or 0))
-    k6.metric("隐藏货号", int(counts["hidden_styles"] or 0))
+    _ui_status_cards(
+        [
+            ("GOAT行数", int(counts["items"] or 0)),
+            ("已评分", int(counts["scored"] or 0)),
+            ("本次处理", int(worker_state.get("completed") or 0) if worker_matches_current else 0),
+            ("有StockX Ask", int(counts["with_ask"] or 0)),
+            ("缺StockX Ask", int(counts["missing_ask"] or 0)),
+            ("隐藏货号", int(counts["hidden_styles"] or 0)),
+        ]
+    )
 
     today_text = datetime.now().date().isoformat()
     if not st.session_state.get("goat_filter_release_from"):
         st.session_state["goat_filter_release_from"] = "2020-01-01"
     if not st.session_state.get("goat_filter_release_to"):
         st.session_state["goat_filter_release_to"] = today_text
+    _ui_section_label("筛选和结果", "筛选只影响下方列表和导出，不会改动后台补数任务。")
     goat_sort_fields = [
         "预估利润",
         "售罄天数",
