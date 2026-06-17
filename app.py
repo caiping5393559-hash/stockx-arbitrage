@@ -3461,7 +3461,7 @@ def _save_uploaded_file_copy(uploaded: Any, directory: Path, *, prefix: str) -> 
 
 def render_sku_upload_panel(conn, *, key_prefix: str, default_source: str = "manual") -> None:
     upload_cols = st.columns([1.45, 0.85, 1.0])
-    uploaded = upload_cols[0].file_uploader("上传货号 Excel / CSV", type=["xlsx", "xls", "csv"], key=f"{key_prefix}_sku_upload")
+    uploaded = upload_cols[0].file_uploader("上传货号 Excel / CSV / ZIP", type=["xlsx", "xls", "csv", "zip"], key=f"{key_prefix}_sku_upload")
     source_name = upload_cols[1].text_input("来源名称", value=default_source, key=f"{key_prefix}_sku_source")
     if uploaded is not None and upload_cols[2].button("导入货号清单", type="primary", use_container_width=True, key=f"{key_prefix}_sku_import"):
         try:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import re
 import sqlite3
+import zipfile
 from dataclasses import dataclass
 from typing import Any
 
@@ -118,12 +119,25 @@ TITLE_COLUMN_CANDIDATES = (
 )
 
 
+STOCKX_TOP1000_MARKERS = {
+    "productname",
+    "styleid",
+    "lowestask",
+    "last72hrsalecount",
+    "annualsalescount",
+}
+
+
 @dataclass
 class ImportResult:
     import_id: int
     rows_seen: int
     rows_imported: int
     sheets: list[str]
+
+    @property
+    def sheet_names(self) -> list[str]:
+        return self.sheets
 
 
 def normalize_column(name: Any) -> str:
@@ -289,6 +303,11 @@ def _clean_price(value: Any) -> float | None:
 
 
 def _find_reference_price(row: pd.Series) -> tuple[float | None, str | None]:
+    for preferred in ("Lowest Ask", "lowest_ask", "Current Ask", "Ask"):
+        value = _row_value(row, preferred)
+        price = _clean_price(value)
+        if price is not None:
+            return price, preferred
     best: tuple[float | None, str | None] = (None, None)
     for column, value in row.items():
         normalized = normalize_column(column)
@@ -304,8 +323,92 @@ def _find_reference_price(row: pd.Series) -> tuple[float | None, str | None]:
     return best
 
 
+def _stockx_top1000_reference_price(row: pd.Series) -> tuple[float | None, str | None]:
+    price = _clean_price(_row_value(row, "Lowest Ask", "lowest_ask"))
+    return (price, "Lowest Ask") if price is not None else (None, None)
+
+
+def _looks_like_stockx_top1000(frame: pd.DataFrame) -> bool:
+    columns = {normalize_column(column) for column in frame.columns}
+    return len(columns & STOCKX_TOP1000_MARKERS) >= 3
+
+
+def _stockx_category_from_name(file_name: str, sheet_name: str) -> str | None:
+    text = f"{file_name} {sheet_name}".lower()
+    for category in ("sneakers", "shoes", "apparel", "accessories", "collectibles", "electronics", "trading-cards"):
+        if category in text:
+            return category
+    return None
+
+
+def _row_value(row: pd.Series, *names: str) -> Any:
+    normalized = {normalize_column(column): column for column in row.index}
+    for name in names:
+        column = normalized.get(normalize_column(name))
+        if column is not None:
+            return row.get(column)
+    return None
+
+
+def _clean_text(value: Any) -> str | None:
+    if value is None or pd.isna(value):
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _upsert_import_product(conn: sqlite3.Connection, style_no: str, row: pd.Series) -> None:
+    product_id = _clean_text(_row_value(row, "Id", "Product Id", "product_id"))
+    title = _clean_text(_row_value(row, "Product Name", "Title", "Name"))
+    brand = _clean_text(_row_value(row, "Brand"))
+    release_date = _clean_text(_row_value(row, "Release Date", "release_date"))
+    image_url = _clean_text(_row_value(row, "ImageUrl", "Image URL", "image_url"))
+    if not any((product_id, title, brand, release_date, image_url)):
+        return
+    conn.execute(
+        """
+        INSERT INTO products (
+            product_id, style_no, title, brand, release_date, image_url, raw_json, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(style_no) DO UPDATE SET
+            product_id=COALESCE(excluded.product_id, products.product_id),
+            title=COALESCE(excluded.title, products.title),
+            brand=COALESCE(excluded.brand, products.brand),
+            release_date=COALESCE(excluded.release_date, products.release_date),
+            image_url=COALESCE(excluded.image_url, products.image_url),
+            raw_json=excluded.raw_json,
+            updated_at=excluded.updated_at
+        """,
+        (
+            product_id,
+            style_no,
+            title,
+            brand,
+            release_date,
+            image_url,
+            json_dumps(row.to_dict()),
+            utc_now(),
+        ),
+    )
+
+
 def _dataframes_from_upload(file_name: str, content: bytes) -> dict[str, pd.DataFrame]:
     lower_name = file_name.lower()
+    if lower_name.endswith(".zip"):
+        dataframes: dict[str, pd.DataFrame] = {}
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                inner_name = info.filename.replace("\\", "/").split("/")[-1]
+                if inner_name.startswith("~$") or not inner_name.lower().endswith((".csv", ".xlsx", ".xls")):
+                    continue
+                for sheet_name, frame in _dataframes_from_upload(inner_name, archive.read(info)).items():
+                    dataframes[f"{inner_name}::{sheet_name}"] = frame
+        if not dataframes:
+            raise ValueError("ZIP 里没有可导入的 CSV/XLSX 文件")
+        return dataframes
     if lower_name.endswith(".csv"):
         last_error: Exception | None = None
         for encoding in ("utf-8-sig", "utf-8", "gb18030", "gbk", None):
@@ -359,9 +462,15 @@ def import_sku_file(
             style_col = _detect_style_column_by_content(clean_frame)
         rank_col = _find_column(list(clean_frame.columns), RANK_COLUMN_CANDIDATES)
         title_col = _find_column(list(clean_frame.columns), TITLE_COLUMN_CANDIDATES)
+        is_stockx_top1000 = _looks_like_stockx_top1000(clean_frame)
+        stockx_category = _stockx_category_from_name(file_name, sheet_name)
 
-        for _, row in clean_frame.iterrows():
-            if style_col is not None:
+        for row_index, row in clean_frame.iterrows():
+            if is_stockx_top1000:
+                if style_col is None:
+                    continue
+                style_no = _clean_style_from_named_column(row.get(style_col))
+            elif style_col is not None:
                 style_no = _clean_style_from_named_column(row.get(style_col))
             else:
                 style_no = _scan_row_for_style(row)
@@ -369,6 +478,8 @@ def import_sku_file(
                 continue
 
             rank = _clean_rank(row.get(rank_col)) if rank_col is not None else None
+            if rank is None and is_stockx_top1000:
+                rank = int(row_index) + 1
             title_hint = str(row.get(title_col)).strip() if title_col is not None and row.get(title_col) else None
             conn.execute(
                 """
@@ -389,18 +500,23 @@ def import_sku_file(
                     imported_at,
                 ),
             )
-            reference_price, reference_column = _find_reference_price(row)
+            if is_stockx_top1000:
+                reference_price, reference_column = _stockx_top1000_reference_price(row)
+            else:
+                reference_price, reference_column = _find_reference_price(row)
             if reference_price is not None:
                 upsert_reference_price(
                     conn,
                     style_no=style_no,
                     size=None,
-                    source_name="import",
+                    source_name=f"stockx_top1000_{stockx_category}" if is_stockx_top1000 and stockx_category else "import",
                     price=reference_price,
                     currency="USD",
                     note=f"{sheet_name}:{reference_column}" if reference_column else sheet_name,
                     raw_json=row.to_dict(),
                 )
+            if is_stockx_top1000:
+                _upsert_import_product(conn, style_no, row)
             rows_imported += 1
 
     return ImportResult(import_id, rows_seen, rows_imported, sheet_names)
