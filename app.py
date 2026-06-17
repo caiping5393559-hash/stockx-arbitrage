@@ -6070,28 +6070,27 @@ def page_opportunities(conn, settings) -> None:
         history_cols[0].caption("历史查询：暂无")
     history_cols[2].caption("清空后恢复首页默认：最高买价 300 美金以下，按预计卖完天数少到多。")
 
-    with st.form("opportunity_search_form", clear_on_submit=False):
-        filter_cols = st.columns([1.25, 0.75, 0.9, 0.9, 0.8, 0.75, 0.8, 0.75])
-        filter_style_text = filter_cols[0].text_input("货号", placeholder="例如 HQ6998-200", key="opp_filter_style").strip()
-        filter_size_text = normalize_us_size(
-            filter_cols[1].text_input("US尺码", placeholder="例如 11", key="opp_filter_size").strip()
-        )
-        min_buy_price = optional_float(filter_cols[2].text_input("最低最高买价", placeholder="例如 120", key="opp_filter_min_buy"))
-        max_buy_price = optional_float(
-            filter_cols[3].text_input("最高买价不超过", placeholder="例如 180", key="opp_filter_max_buy")
-        )
-        release_days_op = filter_cols[4].selectbox("发售天数", ["不限", "大于等于", "小于等于"], index=0, key="opp_filter_release_op")
-        release_days_value = optional_int(
-            filter_cols[5].text_input("天数", placeholder="例如 90", key="release_days_filter_value")
-        )
-        sell_days_op = filter_cols[6].selectbox("卖完天数", ["不限", "大于等于", "小于等于"], index=0, key="opp_filter_sell_op")
-        sell_days_value = optional_float(
-            filter_cols[7].text_input("天数", placeholder="例如 21", key="sell_days_filter_value")
-        )
-        sort_cols = st.columns([2.4, 0.9, 0.9])
-        sort_label = sort_cols[0].selectbox("排序依据", list(sort_options.keys()), index=0, key="opp_sort_label")
-        search_submitted = sort_cols[1].form_submit_button("确定查询", use_container_width=True)
-        clear_submitted = sort_cols[2].form_submit_button("清空条件", use_container_width=True)
+    filter_cols = st.columns([1.25, 0.75, 0.9, 0.9, 0.8, 0.75, 0.8, 0.75])
+    filter_style_text = filter_cols[0].text_input("货号", placeholder="例如 HQ6998-200", key="opp_filter_style").strip()
+    filter_size_text = normalize_us_size(
+        filter_cols[1].text_input("US尺码", placeholder="例如 11", key="opp_filter_size").strip()
+    )
+    min_buy_price = optional_float(filter_cols[2].text_input("最低最高买价", placeholder="例如 120", key="opp_filter_min_buy"))
+    max_buy_price = optional_float(
+        filter_cols[3].text_input("最高买价不超过", placeholder="例如 180", key="opp_filter_max_buy")
+    )
+    release_days_op = filter_cols[4].selectbox("发售天数", ["不限", "大于等于", "小于等于"], index=0, key="opp_filter_release_op")
+    release_days_value = optional_int(
+        filter_cols[5].text_input("发售天数值", placeholder="例如 90", key="release_days_filter_value")
+    )
+    sell_days_op = filter_cols[6].selectbox("卖完天数", ["不限", "大于等于", "小于等于"], index=0, key="opp_filter_sell_op")
+    sell_days_value = optional_float(
+        filter_cols[7].text_input("卖完天数值", placeholder="例如 21", key="sell_days_filter_value")
+    )
+    sort_cols = st.columns([2.4, 0.9, 0.9])
+    sort_label = sort_cols[0].selectbox("排序依据", list(sort_options.keys()), index=0, key="opp_sort_label")
+    search_submitted = sort_cols[1].button("确定查询", type="primary", use_container_width=True, key="opp_search_submit")
+    clear_submitted = sort_cols[2].button("清空条件", use_container_width=True, key="opp_search_clear")
 
     if clear_submitted:
         st.session_state["_opp_reset_requested"] = True
