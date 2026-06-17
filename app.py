@@ -601,6 +601,40 @@ st.markdown(
         -webkit-text-fill-color: #6b7280 !important;
         opacity: 1 !important;
     }
+    html body [data-testid="stAppViewContainer"] .main .block-container
+    :is([data-testid="stButton"], [data-testid="stFormSubmitButton"], [data-testid="stDownloadButton"]) button,
+    html body [data-testid="stAppViewContainer"] .main .block-container
+    :is([data-testid="stButton"], [data-testid="stFormSubmitButton"], [data-testid="stDownloadButton"]) button *,
+    html body [data-testid="stAppViewContainer"] .main .block-container
+    :is([data-testid="stButton"], [data-testid="stFormSubmitButton"], [data-testid="stDownloadButton"]) button :is(p, span, div) {
+        background-color: #111827 !important;
+        color: #ffffff !important;
+        -webkit-text-fill-color: #ffffff !important;
+        opacity: 1 !important;
+        text-shadow: none !important;
+    }
+    html body [data-testid="stAppViewContainer"] .main .block-container
+    :is([data-testid="stButton"], [data-testid="stFormSubmitButton"], [data-testid="stDownloadButton"]) button:disabled,
+    html body [data-testid="stAppViewContainer"] .main .block-container
+    :is([data-testid="stButton"], [data-testid="stFormSubmitButton"], [data-testid="stDownloadButton"]) button:disabled * {
+        background-color: #6b7280 !important;
+        color: #ffffff !important;
+        -webkit-text-fill-color: #ffffff !important;
+        opacity: 1 !important;
+    }
+    html body [data-testid="stAppViewContainer"] .main .block-container
+    :is([data-testid="stRadio"], [data-testid="stCheckbox"], [data-testid="stToggle"]) *,
+    html body [data-testid="stAppViewContainer"] .main .block-container
+    :is([role="radiogroup"], [role="tablist"], [role="tab"]) * {
+        color: #111827 !important;
+        -webkit-text-fill-color: #111827 !important;
+        opacity: 1 !important;
+    }
+    html body [data-testid="stAppViewContainer"] .main .block-container [role="tab"][aria-selected="true"] *,
+    html body [data-testid="stAppViewContainer"] .main .block-container [data-baseweb="tab-highlight"] {
+        color: #ef4444 !important;
+        -webkit-text-fill-color: #ef4444 !important;
+    }
     @media (max-width: 1300px) {
         .ui-card-grid { grid-template-columns: repeat(3, minmax(140px, 1fr)); }
         .opp-grid { grid-template-columns: repeat(3, minmax(150px, 1fr)); }
