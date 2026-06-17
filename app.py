@@ -514,6 +514,7 @@ st.markdown(
 ENV_PATH = BASE_DIR / ".env"
 AUTO_FULL_REFRESH_FLAG = BASE_DIR / "data" / "auto_full_refresh.flag"
 AUTO_HOURLY_SYNC_MARKER = BASE_DIR / "data" / "auto_hourly_full_sync.json"
+CORE_BACKUP_BOOTSTRAP_MARKER = BASE_DIR / "data" / "core_backup_bootstrap.json"
 OPPORTUNITY_SEARCH_HISTORY_PATH = BASE_DIR / "data" / "opportunity_search_history.json"
 GOAT_RESCORE_REQUEST_PATH = BASE_DIR / "data" / "goat_rescore_request.json"
 GOAT_STOCKX_WORKER_MARKER_PATH = BASE_DIR / "data" / "goat_stockx_worker.json"
@@ -2822,6 +2823,34 @@ def schedule_cloud_backup(reason: str) -> None:
                 pass
 
     threading.Thread(target=worker, daemon=True).start()
+
+
+def schedule_startup_core_backup_if_needed(settings) -> None:
+    if not settings.firebase_enabled:
+        return
+    try:
+        marker = json_loads(CORE_BACKUP_BOOTSTRAP_MARKER.read_text(encoding="utf-8"), {}) or {}
+    except OSError:
+        marker = {}
+    last_ts = _timestamp_from_marker(marker.get("last_started_ts"))
+    if last_ts and datetime.utcnow().timestamp() - last_ts < 3600:
+        return
+    try:
+        CORE_BACKUP_BOOTSTRAP_MARKER.parent.mkdir(parents=True, exist_ok=True)
+        CORE_BACKUP_BOOTSTRAP_MARKER.write_text(
+            json.dumps(
+                {
+                    "last_started_at": datetime.utcnow().isoformat(timespec="seconds"),
+                    "last_started_ts": datetime.utcnow().timestamp(),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+    schedule_cloud_backup("startup_core_backup")
 
 
 def sync_style_isolated(
@@ -7569,6 +7598,7 @@ def main() -> None:
     if not _require_app_login(settings):
         return
     conn = get_conn()
+    schedule_startup_core_backup_if_needed(settings)
     _refresh_cache_after_sync_if_needed()
     st.sidebar.title("套利扫描器")
     if settings.app_login_enabled:
