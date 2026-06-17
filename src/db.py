@@ -261,6 +261,50 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_opportunity_rating
             ON opportunity_scores(rating, score);
 
+        CREATE TABLE IF NOT EXISTS opportunity_import_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            import_id INTEGER NOT NULL,
+            source_name TEXT,
+            file_name TEXT,
+            row_count INTEGER NOT NULL DEFAULT 0,
+            style_count INTEGER NOT NULL DEFAULT 0,
+            score_count INTEGER NOT NULL DEFAULT 0,
+            archived_at TEXT NOT NULL,
+            note TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_opportunity_snapshots_import
+            ON opportunity_import_snapshots(import_id, archived_at);
+
+        CREATE TABLE IF NOT EXISTS opportunity_score_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            snapshot_id INTEGER NOT NULL,
+            original_score_id INTEGER,
+            product_id TEXT,
+            style_no TEXT NOT NULL,
+            title TEXT,
+            brand TEXT,
+            size TEXT NOT NULL,
+            score REAL NOT NULL,
+            rating TEXT NOT NULL,
+            recommended_buy_qty INTEGER NOT NULL DEFAULT 0,
+            max_buy_price REAL,
+            weighted_avg_cost REAL,
+            next_lowest_ask REAL,
+            target_sell_price_low REAL,
+            target_sell_price_high REAL,
+            estimated_profit REAL,
+            estimated_profit_per_pair REAL,
+            estimated_days_to_sell REAL,
+            release_date TEXT,
+            release_days INTEGER,
+            risk_notes TEXT,
+            components_json TEXT NOT NULL,
+            computed_at TEXT NOT NULL,
+            archived_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_opportunity_history_snapshot
+            ON opportunity_score_history(snapshot_id, score, estimated_profit);
+
         CREATE TABLE IF NOT EXISTS goat_consignment_items (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             import_batch TEXT NOT NULL,

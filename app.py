@@ -3065,16 +3065,8 @@ def _load_all_imported_styles_for_auto_sync(db_path: Path) -> list[str]:
     conn = connect(db_path)
     init_db(conn)
     try:
-        rows = query_rows(
-            conn,
-            """
-            SELECT DISTINCT style_no
-            FROM sku_items
-            WHERE style_no IS NOT NULL AND TRIM(style_no) != ''
-            ORDER BY style_no
-            """,
-        )
-        return [str(row["style_no"]).strip().upper() for row in rows if row["style_no"]]
+        _, _, styles, _ = latest_stockx_import_scope(conn)
+        return [str(style).strip().upper() for style in styles if style]
     finally:
         conn.close()
 
@@ -3461,20 +3453,88 @@ def _save_uploaded_file_copy(uploaded: Any, directory: Path, *, prefix: str) -> 
     return content, target
 
 
+def archive_current_opportunity_snapshot(conn, *, note: str = "new_import") -> dict[str, Any]:
+    import_id, row_count, styles, scope_sql = latest_stockx_import_scope(conn)
+    if not import_id:
+        return {"archived": False, "reason": "no_import"}
+    import_row = conn.execute(
+        "SELECT source_name, file_name FROM sku_imports WHERE id = ?",
+        (import_id,),
+    ).fetchone()
+    if not import_row:
+        return {"archived": False, "reason": "missing_import"}
+    score_count = int(conn.execute(f"SELECT COUNT(*) FROM opportunity_scores WHERE style_no IN ({scope_sql})").fetchone()[0] or 0)
+    if score_count <= 0:
+        return {"archived": False, "reason": "no_scores", "import_id": import_id}
+    archived_at = datetime.utcnow().isoformat(timespec="seconds")
+    cur = conn.execute(
+        """
+        INSERT INTO opportunity_import_snapshots (
+            import_id, source_name, file_name, row_count, style_count, score_count, archived_at, note
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            import_id,
+            import_row["source_name"],
+            import_row["file_name"],
+            int(row_count),
+            len(styles),
+            score_count,
+            archived_at,
+            note,
+        ),
+    )
+    snapshot_id = int(cur.lastrowid)
+    conn.execute(
+        f"""
+        INSERT INTO opportunity_score_history (
+            snapshot_id, original_score_id, product_id, style_no, title, brand, size, score, rating,
+            recommended_buy_qty, max_buy_price, weighted_avg_cost, next_lowest_ask,
+            target_sell_price_low, target_sell_price_high, estimated_profit, estimated_profit_per_pair,
+            estimated_days_to_sell, release_date, release_days, risk_notes, components_json,
+            computed_at, archived_at
+        )
+        SELECT
+            ?, id, product_id, style_no, title, brand, size, score, rating,
+            recommended_buy_qty, max_buy_price, weighted_avg_cost, next_lowest_ask,
+            target_sell_price_low, target_sell_price_high, estimated_profit, estimated_profit_per_pair,
+            estimated_days_to_sell, release_date, release_days, risk_notes, components_json,
+            computed_at, ?
+        FROM opportunity_scores
+        WHERE style_no IN ({scope_sql})
+        """,
+        (snapshot_id, archived_at),
+    )
+    return {
+        "archived": True,
+        "snapshot_id": snapshot_id,
+        "import_id": import_id,
+        "score_count": score_count,
+        "style_count": len(styles),
+    }
+
+
 def render_sku_upload_panel(conn, *, key_prefix: str, default_source: str = "manual") -> None:
     upload_cols = st.columns([1.45, 0.85, 1.0])
     uploaded = upload_cols[0].file_uploader("上传货号 Excel / CSV / ZIP", type=["xlsx", "xls", "csv", "zip"], key=f"{key_prefix}_sku_upload")
     source_name = upload_cols[1].text_input("来源名称", value=default_source, key=f"{key_prefix}_sku_source")
     if uploaded is not None and upload_cols[2].button("导入货号清单", type="primary", use_container_width=True, key=f"{key_prefix}_sku_import"):
         try:
+            archived = archive_current_opportunity_snapshot(conn, note=f"before_import:{uploaded.name}")
             content, saved_path = _save_uploaded_file_copy(uploaded, SKU_UPLOAD_DIR, prefix="sku")
             result = import_sku_file(conn, file_name=uploaded.name, content=content, source_name=source_name or "manual")
             conn.commit()
             bump_data_cache_version()
             schedule_cloud_backup("sku_import")
+            archived_text = (
+                f"；上一个清单已归档快照 {archived.get('score_count')} 行"
+                if archived.get("archived")
+                else ""
+            )
             st.session_state["sync_notice"] = (
                 f"导入完成：识别 {result.rows_imported}/{result.rows_seen} 行；"
-                f"sheet：{', '.join(result.sheet_names)}；源文件已保存到 {_path_display(saved_path)}。"
+                f"sheet：{', '.join(result.sheet_names)}；源文件已保存到 {_path_display(saved_path)}{archived_text}。"
             )
             st.rerun()
         except Exception as exc:
@@ -3591,6 +3651,85 @@ def latest_stockx_import_scope(conn) -> tuple[int | None, int, list[str], str]:
         f"WHERE import_id = {import_id} AND style_no IS NOT NULL AND TRIM(style_no) != ''"
     )
     return import_id, int(row_count), styles, scope_sql
+
+
+def render_opportunity_snapshot_history(conn, settings) -> None:
+    with st.expander("历史源文件结果快照（只读，不参与自动刷新）", expanded=False):
+        snapshots = query_rows(
+            conn,
+            """
+            SELECT id, import_id, source_name, file_name, row_count, style_count, score_count, archived_at, note
+            FROM opportunity_import_snapshots
+            ORDER BY id DESC
+            LIMIT 50
+            """,
+        )
+        cols = st.columns([1, 3])
+        if cols[0].button("保存当前结果为历史快照", use_container_width=True, key="save_current_opp_snapshot"):
+            archived = archive_current_opportunity_snapshot(conn, note="manual_snapshot")
+            conn.commit()
+            bump_data_cache_version()
+            schedule_cloud_backup("opportunity_snapshot")
+            if archived.get("archived"):
+                st.success(f"已保存当前快照：{archived.get('score_count')} 行。")
+            else:
+                st.info(f"当前没有可归档结果：{archived.get('reason')}")
+            st.rerun()
+        cols[1].caption("历史快照固定为当时保存的结果；不会被每小时接口刷新修改。")
+        if not snapshots:
+            st.caption("暂无历史快照。上传新清单前会自动归档当前结果，也可以点上面的按钮手动保存。")
+            return
+        labels = [
+            f"#{row['id']}｜{row['file_name'] or '-'}｜{row['score_count']} 行｜{_format_datetime_minute(row['archived_at'])}"
+            for row in snapshots
+        ]
+        selected = st.selectbox("选择历史源文件结果", labels, key="opportunity_snapshot_select")
+        snapshot_id = int(snapshots[labels.index(selected)]["id"])
+        rows = query_rows(
+            conn,
+            """
+            SELECT
+                rating AS 评级,
+                ROUND(score, 1) AS 分数,
+                style_no AS 货号,
+                size AS 尺码,
+                title AS 商品名,
+                recommended_buy_qty AS 买入双数,
+                max_buy_price AS 最高买价,
+                weighted_avg_cost AS 加权均价,
+                target_sell_price_low AS 建议卖价低位,
+                target_sell_price_high AS 建议卖价高位,
+                estimated_profit AS 总利润,
+                estimated_profit_per_pair AS 每双利润,
+                estimated_days_to_sell AS 预计卖完天数,
+                release_date AS 发售日期,
+                release_days AS 发售天数,
+                risk_notes AS 风险说明,
+                computed_at AS 当时计算时间
+            FROM opportunity_score_history
+            WHERE snapshot_id = ?
+            ORDER BY
+                CASE WHEN estimated_profit IS NULL THEN 1 ELSE 0 END,
+                estimated_profit DESC,
+                score DESC
+            LIMIT 2000
+            """,
+            (snapshot_id,),
+        )
+        frame = pd.DataFrame([dict(row) for row in rows])
+        if frame.empty:
+            st.info("这个历史快照没有结果行。")
+            return
+        dcols = st.columns([1.2, 3])
+        dcols[0].download_button(
+            "导出历史快照 CSV",
+            data=_csv_download_bytes(frame),
+            file_name=_export_file_name(f"opportunity_snapshot_{snapshot_id}"),
+            mime="text/csv",
+            use_container_width=True,
+        )
+        dcols[1].caption(f"当前预览 {len(frame)} 行；历史快照不会继续跑接口。")
+        st.dataframe(frame, use_container_width=True, height=420, hide_index=True)
 
 
 def load_incomplete_stockx_skus(conn) -> list[str]:
@@ -5514,6 +5653,7 @@ def page_opportunities(conn, settings) -> None:
     )
     with st.expander("导入货号 / GOAT热销榜（上传入口）", expanded=True):
         render_sku_upload_panel(conn, key_prefix="opportunity", default_source="manual")
+    render_opportunity_snapshot_history(conn, settings)
 
     auto_status = _render_auto_hourly_status(settings)
 
