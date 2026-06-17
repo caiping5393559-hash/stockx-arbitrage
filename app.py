@@ -3715,14 +3715,25 @@ def archive_current_opportunity_snapshot(conn, *, note: str = "new_import") -> d
 
 
 def render_sku_upload_panel(conn, *, key_prefix: str, default_source: str = "manual") -> None:
-    upload_cols = st.columns([1.45, 0.85, 1.0])
-    uploaded = upload_cols[0].file_uploader("上传货号 Excel / CSV / ZIP", type=["xlsx", "xls", "csv", "zip"], key=f"{key_prefix}_sku_upload")
-    source_name = upload_cols[1].text_input("来源名称", value=default_source, key=f"{key_prefix}_sku_source")
+    upload_cols = st.columns([1.8, 1.05, 0.95])
+    uploaded = upload_cols[0].file_uploader(
+        "上传货号清单（Excel / CSV / ZIP）",
+        type=["xlsx", "xls", "csv", "zip"],
+        key=f"{key_prefix}_sku_upload",
+    )
+    default_label = "手动上传" if default_source == "manual" else default_source
+    source_name = upload_cols[1].text_input(
+        "来源 / 批次名（可不填）",
+        value=default_label,
+        help="只是给这次上传起一个名字，方便以后在历史结果里找回。例如：StockX Top1000、GOAT热销榜、手动上传。",
+        key=f"{key_prefix}_sku_source",
+    )
     if uploaded is not None and upload_cols[2].button("导入货号清单", type="primary", use_container_width=True, key=f"{key_prefix}_sku_import"):
         try:
             archived = archive_current_opportunity_snapshot(conn, note=f"before_import:{uploaded.name}")
             content, saved_path = _save_uploaded_file_copy(uploaded, SKU_UPLOAD_DIR, prefix="sku")
-            result = import_sku_file(conn, file_name=uploaded.name, content=content, source_name=source_name or "manual")
+            stored_source = "manual" if source_name in ("", "手动上传") else source_name
+            result = import_sku_file(conn, file_name=uploaded.name, content=content, source_name=stored_source)
             conn.commit()
             bump_data_cache_version()
             schedule_cloud_backup("sku_import")
@@ -6023,7 +6034,7 @@ def page_opportunities(conn, settings) -> None:
     _ensure_opportunity_search_defaults(sort_options)
 
     history = _read_opportunity_search_history()
-    mode_cols = st.columns([1.25, 1.35, 1.55, 1.2])
+    mode_cols = st.columns([1.25, 1.35, 2.3])
     with mode_cols[0]:
         rating_scope = st.selectbox(
             "等级范围",
@@ -6042,10 +6053,7 @@ def page_opportunities(conn, settings) -> None:
         )
         include_young = release_scope == "包含发售不足90天"
         st.session_state["opp_include_young_scope"] = include_young
-    mode_cols[2].caption("输入货号/尺码时会自动放开等级过滤。")
-    if mode_cols[3].button("清空条件", use_container_width=True):
-        _reset_opportunity_search_state()
-        st.rerun()
+    mode_cols[2].caption("输入货号/尺码时会自动放开等级过滤。清空条件会恢复首页默认：最高买价 300 美金以下，按预计卖完天数少到多。")
 
     history_cols = st.columns([2.4, 0.9, 3.2])
     if history:
@@ -6079,10 +6087,14 @@ def page_opportunities(conn, settings) -> None:
         sell_days_value = optional_float(
             filter_cols[7].text_input("天数", placeholder="例如 21", key="sell_days_filter_value")
         )
-        sort_cols = st.columns([3, 1.2])
+        sort_cols = st.columns([2.4, 0.9, 0.9])
         sort_label = sort_cols[0].selectbox("排序依据", list(sort_options.keys()), index=0, key="opp_sort_label")
         search_submitted = sort_cols[1].form_submit_button("确定查询", use_container_width=True)
+        clear_submitted = sort_cols[2].form_submit_button("清空条件", use_container_width=True)
 
+    if clear_submitted:
+        _reset_opportunity_search_state()
+        st.rerun()
     if search_submitted:
         _save_opportunity_search_history(_opportunity_search_snapshot())
 
@@ -6156,7 +6168,7 @@ def page_opportunities(conn, settings) -> None:
         tuple(params),
     )
     if not export_rows:
-        st.radio("显示方式", ["卡片视图", "紧凑表格", "引用数据"], horizontal=True, disabled=True)
+        st.selectbox("显示方式", ["卡片视图", "紧凑表格", "引用数据"], disabled=True, key="opp_display_mode_empty")
         st.info("暂无机会数据。先在「SKU 导入 / 同步」导入货号并同步接口。")
         st.caption("卡片视角依赖 opportunity_scores 评分结果；当前筛选没有评分结果时，只能先看下面的导入货号覆盖情况。")
     else:
@@ -6181,7 +6193,9 @@ def page_opportunities(conn, settings) -> None:
         else:
             strategy_frame = pd.DataFrame([_strategy_summary_from_row(row) for row in rows])
             reference_frame = pd.DataFrame([_reference_summary_from_row(row) for row in rows])
-            display_mode = st.radio("显示方式", ["卡片视图", "紧凑表格", "引用数据"], horizontal=True)
+            display_cols = st.columns([1.15, 4])
+            display_mode = display_cols[0].selectbox("显示方式", ["卡片视图", "紧凑表格", "引用数据"], key="opp_display_mode")
+            display_cols[1].caption("卡片视图看购买策略；紧凑表格适合批量筛选；引用数据只看接口/成交参考。")
             if display_mode == "卡片视图":
                 max_visible = min(100, len(rows))
                 if max_visible <= 5:
