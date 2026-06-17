@@ -1,6 +1,8 @@
 ﻿from __future__ import annotations
 
 import json
+import base64
+import hashlib
 import hmac
 import math
 import os
@@ -7225,6 +7227,92 @@ def page_logs(conn) -> None:
         st.json(json_loads(row.get("response_json"), {}))
 
 
+REMEMBER_LOGIN_KEY = "stockx_goat_remember_token"
+REMEMBER_LOGIN_DAYS = 30
+
+
+def _remember_login_signature(payload: str, secret: str) -> str:
+    return hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _make_remember_login_token(username: str, password_secret: str) -> str:
+    payload_data = {
+        "u": username,
+        "exp": int(time_module.time()) + REMEMBER_LOGIN_DAYS * 24 * 60 * 60,
+    }
+    payload = base64.urlsafe_b64encode(json.dumps(payload_data, separators=(",", ":")).encode("utf-8")).decode("ascii")
+    sig = _remember_login_signature(payload, password_secret)
+    return f"{payload}.{sig}"
+
+
+def _validate_remember_login_token(token: str, settings) -> bool:
+    if not token or "." not in token or not settings.app_password:
+        return False
+    payload, sig = token.rsplit(".", 1)
+    expected = _remember_login_signature(payload, settings.app_password)
+    if not hmac.compare_digest(sig, expected):
+        return False
+    try:
+        data = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")).decode("utf-8"))
+    except Exception:
+        return False
+    if str(data.get("u") or "") != str(settings.app_username or ""):
+        return False
+    try:
+        if int(data.get("exp") or 0) < int(time_module.time()):
+            return False
+    except Exception:
+        return False
+    return True
+
+
+def _login_storage_bridge(*, token: str | None = None, clear: bool = False) -> None:
+    token_json = json.dumps(token or "")
+    clear_js = "localStorage.removeItem(KEY);" if clear else ""
+    set_js = f"localStorage.setItem(KEY, {token_json});" if token else ""
+    components.html(
+        f"""
+        <script>
+        const KEY = {json.dumps(REMEMBER_LOGIN_KEY)};
+        try {{
+          {clear_js}
+          {set_js}
+          const target = window.parent || window;
+          target.location.href = target.location.pathname;
+        }} catch (err) {{}}
+        </script>
+        """,
+        height=0,
+    )
+
+
+def _render_remember_login_probe() -> None:
+    components.html(
+        f"""
+        <script>
+        const KEY = {json.dumps(REMEMBER_LOGIN_KEY)};
+        try {{
+          const token = localStorage.getItem(KEY);
+          const target = window.parent || window;
+          const url = new URL(target.location.href);
+          if (token && !url.searchParams.get("remember_token")) {{
+            url.searchParams.set("remember_token", token);
+            target.location.href = url.toString();
+          }}
+        }} catch (err) {{}}
+        </script>
+        """,
+        height=0,
+    )
+
+
+def _query_param_first(name: str) -> str:
+    value = st.query_params.get(name)
+    if isinstance(value, list):
+        return str(value[0]) if value else ""
+    return str(value or "")
+
+
 def _require_app_login(settings) -> bool:
     if not settings.app_login_enabled:
         return True
@@ -7233,6 +7321,23 @@ def _require_app_login(settings) -> bool:
         return False
     if st.session_state.get("app_authenticated"):
         return True
+
+    if _query_param_first("logout") == "1":
+        st.session_state["app_authenticated"] = False
+        _login_storage_bridge(clear=True)
+        st.info("已退出登录。")
+        return False
+
+    remember_token = _query_param_first("remember_token")
+    if remember_token and _validate_remember_login_token(remember_token, settings):
+        st.session_state["app_authenticated"] = True
+        try:
+            st.query_params.clear()
+        except Exception:
+            pass
+        st.rerun()
+
+    _render_remember_login_probe()
 
     st.markdown(
         """
@@ -7267,13 +7372,19 @@ def _require_app_login(settings) -> bool:
         with st.form("app_login_form"):
             username = st.text_input("账号")
             password = st.text_input("密码", type="password")
+            remember_me = st.checkbox("记住登录，30 天内免输入", value=True)
             submitted = st.form_submit_button("登录", use_container_width=True)
     if submitted:
         username_ok = hmac.compare_digest(str(username or ""), str(settings.app_username or ""))
         password_ok = hmac.compare_digest(str(password or ""), str(settings.app_password or ""))
         if username_ok and password_ok:
             st.session_state["app_authenticated"] = True
-            st.rerun()
+            if remember_me:
+                _login_storage_bridge(token=_make_remember_login_token(str(settings.app_username or ""), str(settings.app_password or "")))
+                st.success("已记住登录。")
+                return False
+            else:
+                st.rerun()
         else:
             st.error("账号或密码不正确。")
     return False
@@ -7291,9 +7402,7 @@ def main() -> None:
     _refresh_cache_after_sync_if_needed()
     st.sidebar.title("套利扫描器")
     if settings.app_login_enabled:
-        if st.sidebar.button("退出登录", use_container_width=True):
-            st.session_state["app_authenticated"] = False
-            st.rerun()
+        st.sidebar.markdown('<a href="?logout=1" target="_self">退出登录并清除记住状态</a>', unsafe_allow_html=True)
     sync_state = _sync_state_snapshot()
     if sync_state.get("status") == "running":
         st.sidebar.info(f"后台运行中：{sync_state.get('completed', 0)}/{sync_state.get('total', 0)}")
