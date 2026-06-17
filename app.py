@@ -5893,6 +5893,22 @@ def page_opportunities(conn, settings) -> None:
     sync_state = _sync_state_snapshot()
     auto_status = _auto_hourly_status_snapshot(settings)
     job_running = sync_state.get("status") == "running" or bool(auto_status.get("running"))
+    if (
+        active_import_id
+        and product_styles > 0
+        and scored_count == 0
+        and not job_running
+        and st.session_state.get("_opp_zero_score_recovery_import_id") != active_import_id
+    ):
+        st.session_state["_opp_zero_score_recovery_import_id"] = active_import_id
+        job_id = start_recompute_job(
+            db_path_str=str(settings.db_path),
+            fee_rate=settings.estimated_seller_fee_rate,
+            sales_fraction=settings.buy_depth_sales_fraction,
+        )
+        if job_id:
+            st.session_state["sync_notice"] = "检测到当前批次评分为0，已自动启动本地评分恢复。"
+            st.rerun()
     _frontend_auto_refresh(job_running, interval_seconds=8, key="opportunity_progress")
 
     setup_tabs = st.tabs(["当前源文件 / 上传", "任务 / 数据维护", "历史结果"])

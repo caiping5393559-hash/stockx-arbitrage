@@ -47,7 +47,6 @@ def reset_style_snapshots(conn: sqlite3.Connection, style_no: str) -> None:
         "ask_depth",
         "bid_depth",
         "product_sizes",
-        "opportunity_scores",
     ):
         conn.execute(f"DELETE FROM {table_name} WHERE style_no = ?", (normalized,))
     log_sync(
