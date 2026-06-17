@@ -515,6 +515,7 @@ GOAT_DEFAULT_CONSIGNMENT_PATH = Path(
 )
 GOAT_UPLOAD_DIR = BASE_DIR / "data" / "goat_uploads"
 SKU_UPLOAD_DIR = BASE_DIR / "data" / "sku_uploads"
+GOAT_BUY_COST_ADDER_USD = 6.0
 PAUSED_STOCKX_TASK_PATH = BASE_DIR / "data" / "paused_stockx_task.json"
 AUTO_HOURLY_SYNC_POLL_SECONDS = 60
 AUTO_HOURLY_SYNC_MIN_INTERVAL_SECONDS = 15 * 60
@@ -1414,7 +1415,7 @@ def _import_goat_consignment_rows(conn, frame: pd.DataFrame, *, source_name: str
         goat_price = _goat_price_from_row(raw, column_mapping)
         if not pid or not style_no or not size or goat_price is None:
             continue
-        buy_cost = round(float(goat_price) * 1.03, 2)
+        buy_cost = round(float(goat_price) + GOAT_BUY_COST_ADDER_USD, 2)
         record = {
             "import_batch": import_batch,
             "warehouse_id": str(_goat_row_value(raw, column_mapping, "warehouse_id", "WAREHOUSE_ID") or ""),
@@ -2107,7 +2108,8 @@ def _score_goat_consignment_item(
     stats = sales_info["stats"]
     matched_size = (ask or {}).get("matched_size") or sales_info.get("matched_size") or size
     stockx_ask = float(ask["ask_price"]) if ask and ask.get("ask_price") is not None else None
-    buy_cost = float(item["buy_cost"])
+    buy_cost = round(float(item.get("goat_price") or 0.0) + GOAT_BUY_COST_ADDER_USD, 2)
+    item["buy_cost"] = buy_cost
     net_fee_rate = max(0.0, float(get_settings().estimated_seller_fee_rate if fee_rate is None else fee_rate))
     sell_price = stockx_ask
     net_proceeds = round(sell_price * (1 - net_fee_rate), 2) if sell_price is not None else None
@@ -2182,7 +2184,7 @@ def _score_goat_consignment_item(
             "sell_price_basis": "stockx_lowest_ask",
             "sell_net_proceeds": net_proceeds,
             "payment_fee_rate": net_fee_rate,
-            "buy_cost_formula": "goat_price * 1.03",
+            "buy_cost_formula": f"goat_price + {GOAT_BUY_COST_ADDER_USD:g}",
             "profit_formula": "stockx_lowest_ask * (1 - payment_fee_rate) - buy_cost",
         },
     }
@@ -6278,7 +6280,7 @@ def page_import_sync(conn, settings) -> None:
 
 def _page_goat_consignment_selection_legacy(conn, settings) -> None:
     st.markdown("### GOAT寄存选品")
-    st.caption("导入 GOAT 洛杉矶 S 仓寄存库存；购买成本 = GOAT价格 * 1.03；默认按 StockX 当前最低Ask出售来估算利润和售罄时间。")
+    st.caption("导入 GOAT 洛杉矶 S 仓寄存库存；购买成本 = GOAT价格 + 6 美元；StockX 出售回款按出售价扣 3%。")
 
     upload_cols = st.columns([1.3, 1, 1])
     uploaded = upload_cols[0].file_uploader("上传GOAT寄存CSV/XLSX", type=["csv", "xlsx"], key="goat_consignment_upload")
@@ -6408,7 +6410,7 @@ def _page_goat_consignment_selection_legacy(conn, settings) -> None:
             "matched_stockx_size": "匹配StockX尺码",
             "title": "商品名",
             "goat_price": "GOAT价格",
-            "buy_cost": "购买成本(含3%)",
+            "buy_cost": "采购成本(+6)",
             "stockx_lowest_ask": "引用·StockX最低Ask",
             "avg_7d": "引用·7日成交均价",
             "avg_30d": "引用·30日成交均价",
@@ -6423,7 +6425,7 @@ def _page_goat_consignment_selection_legacy(conn, settings) -> None:
             "computed_at": "评分时间",
         }
     )
-    money_cols = ["GOAT价格", "购买成本(含3%)", "引用·StockX最低Ask", "引用·7日成交均价", "引用·30日成交均价", "默认出售价", "预估利润"]
+    money_cols = ["GOAT价格", "采购成本(+6)", "引用·StockX最低Ask", "引用·7日成交均价", "引用·30日成交均价", "默认出售价", "预估利润"]
     for col in money_cols:
         if col in frame.columns:
             frame[col] = frame[col].apply(money)
@@ -6440,7 +6442,7 @@ def _page_goat_consignment_selection_legacy(conn, settings) -> None:
 
 def page_goat_consignment_selection(conn, settings) -> None:
     st.markdown("### GOAT寄存选品")
-    st.caption("导入 GOAT 洛杉矶 S 仓寄存库存；购买成本 = GOAT价格 * 1.03；缺少StockX本地快照时会在后台实时补接口。")
+    st.caption("导入 GOAT 洛杉矶 S 仓寄存库存；购买成本 = GOAT价格 + 6 美元；StockX 出售回款按出售价扣 3%。")
 
     state = _goat_job_snapshot()
     worker_state = _read_goat_stockx_worker_marker()
@@ -6652,7 +6654,7 @@ def page_goat_consignment_selection(conn, settings) -> None:
             "stockx_lowest_ask": "引用·StockX最低Ask",
             "estimated_sell_price": "默认出售价",
             "goat_price": "GOAT价格",
-            "buy_cost": "购买成本(含3%)",
+            "buy_cost": "采购成本(+6)",
             "estimated_profit_rate_pct": "利润率%",
             "avg_7d": "引用·7日成交均价",
             "avg_30d": "引用·30日成交均价",
@@ -6675,7 +6677,7 @@ def page_goat_consignment_selection(conn, settings) -> None:
         "引用·StockX最低Ask",
         "默认出售价",
         "GOAT价格",
-        "购买成本(含3%)",
+        "采购成本(+6)",
         "利润率%",
         "引用·7日成交均价",
         "引用·30日成交均价",
@@ -6687,7 +6689,7 @@ def page_goat_consignment_selection(conn, settings) -> None:
         "商品名",
     ]
     frame = frame[[col for col in preferred_cols if col in frame.columns]]
-    money_cols = ["预估利润", "引用·StockX最低Ask", "默认出售价", "GOAT价格", "购买成本(含3%)", "引用·7日成交均价", "引用·30日成交均价"]
+    money_cols = ["预估利润", "引用·StockX最低Ask", "默认出售价", "GOAT价格", "采购成本(+6)", "引用·7日成交均价", "引用·30日成交均价"]
     for col in money_cols:
         if col in frame.columns:
             frame[col] = frame[col].apply(money)
@@ -6703,7 +6705,7 @@ def page_goat_consignment_selection(conn, settings) -> None:
 
 def page_goat_consignment_selection(conn, settings) -> None:
     st.title("GOAT寄存选品")
-    st.caption("来源是 GOAT 洛杉矶 S 仓清单；购买成本 = GOAT价格 * 1.03。StockX 最低Ask、7天均价、30天均价和售罄天数独立补数，不和262个StockX导入货号绑定。")
+    st.caption("来源是 GOAT 洛杉矶 S 仓清单；购买成本 = GOAT价格 + 6 美元；StockX 出售回款按出售价扣 3%。StockX 最低Ask、7天均价、30天均价和售罄天数独立补数，不和262个StockX导入货号绑定。")
     _ensure_goat_hidden_styles_table(conn)
     _consume_goat_hidden_style_query(conn)
 
