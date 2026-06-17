@@ -621,13 +621,28 @@ st.markdown(
     html body [data-testid="stAppViewContainer"] .main .block-container
     :is([data-testid="stButton"], [data-testid="stFormSubmitButton"], [data-testid="stDownloadButton"]) button,
     html body [data-testid="stAppViewContainer"] .main .block-container
-    :is([data-testid="stButton"], [data-testid="stFormSubmitButton"], [data-testid="stDownloadButton"]) button *,
-    html body [data-testid="stAppViewContainer"] .main .block-container
     :is([data-testid="stButton"], [data-testid="stFormSubmitButton"], [data-testid="stDownloadButton"]) button :is(p, span, div) {
-        background-color: #111827 !important;
         color: #ffffff !important;
         -webkit-text-fill-color: #ffffff !important;
         opacity: 1 !important;
+        text-shadow: none !important;
+    }
+    html body [data-testid="stAppViewContainer"] .main .block-container
+    :is([data-testid="stButton"], [data-testid="stFormSubmitButton"], [data-testid="stDownloadButton"]) button {
+        background-color: #111827 !important;
+    }
+    html body [data-testid="stAppViewContainer"] .main .block-container
+    :is([data-testid="stButton"], [data-testid="stFormSubmitButton"], [data-testid="stDownloadButton"]) button *,
+    html body [data-testid="stAppViewContainer"] .main .block-container
+    :is([data-testid="stButton"], [data-testid="stFormSubmitButton"], [data-testid="stDownloadButton"]) button p,
+    html body [data-testid="stAppViewContainer"] .main .block-container
+    :is([data-testid="stButton"], [data-testid="stFormSubmitButton"], [data-testid="stDownloadButton"]) button span,
+    html body [data-testid="stAppViewContainer"] .main .block-container
+    :is([data-testid="stButton"], [data-testid="stFormSubmitButton"], [data-testid="stDownloadButton"]) button div {
+        color: #ffffff !important;
+        -webkit-text-fill-color: #ffffff !important;
+        opacity: 1 !important;
+        visibility: visible !important;
         text-shadow: none !important;
     }
     html body [data-testid="stAppViewContainer"] .main .block-container
@@ -1024,41 +1039,9 @@ def _read_lock_file(path: Path) -> dict[str, Any]:
 
 
 def _pause_stockx_task_for_goat(reason: str) -> dict[str, Any]:
-    lock = _read_lock_file(JOB_LOCK_PATH)
-    marker = _read_auto_hourly_marker()
-    lock_job_id = lock.get("job_id")
-    marker_job_id = marker.get("active_job_id")
-    is_stockx_running = bool(lock_job_id or marker_job_id) and str(marker.get("last_status") or "") == "running"
-    if not is_stockx_running:
-        return {"paused": False, "reason": "no active stockx task"}
-
-    _write_json_path(
-        PAUSED_STOCKX_TASK_PATH,
-        {
-            "kind": "stockx_full_refresh",
-            "paused_at": datetime.utcnow().isoformat(timespec="seconds"),
-            "reason": reason,
-            "lock": lock,
-            "marker": marker,
-        },
-    )
-    stopped = _stop_process_tree(lock.get("pid"))
-    try:
-        if JOB_LOCK_PATH.exists():
-            JOB_LOCK_PATH.unlink()
-    except OSError:
-        pass
-    marker.update(
-        {
-            "enabled": False,
-            "active_job_id": None,
-            "last_status": "paused_for_goat",
-            "last_message": "今日机会StockX全量已被GOAT新清单暂停，GOAT完成后自动恢复。",
-            "paused_at": datetime.utcnow().isoformat(timespec="seconds"),
-        }
-    )
-    _write_auto_hourly_marker(marker)
-    return {"paused": True, "stopped": stopped, "job_id": lock_job_id or marker_job_id}
+    # StockX sync jobs run inside the Streamlit process. Killing the lock PID can
+    # terminate the web app itself, so GOAT tasks no longer force-pause them.
+    return {"paused": False, "reason": f"stockx task left running: {reason}"}
 
 
 def _stop_goat_worker_for_new_upload() -> dict[str, Any]:
@@ -6031,6 +6014,8 @@ def page_opportunities(conn, settings) -> None:
         "30天销量（高到低）": ("sales_30d", True),
         "分数（高到低）": ("score", True),
     }
+    if st.session_state.pop("_opp_reset_requested", False):
+        _reset_opportunity_search_state()
     _ensure_opportunity_search_defaults(sort_options)
 
     history = _read_opportunity_search_history()
@@ -6093,7 +6078,7 @@ def page_opportunities(conn, settings) -> None:
         clear_submitted = sort_cols[2].form_submit_button("清空条件", use_container_width=True)
 
     if clear_submitted:
-        _reset_opportunity_search_state()
+        st.session_state["_opp_reset_requested"] = True
         st.rerun()
     if search_submitted:
         _save_opportunity_search_history(_opportunity_search_snapshot())
