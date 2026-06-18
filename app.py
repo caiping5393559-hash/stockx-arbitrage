@@ -2996,6 +2996,106 @@ def schedule_startup_core_backup_if_needed(settings) -> None:
     schedule_cloud_backup("startup_core_backup")
 
 
+def restore_opportunity_scores_from_latest_history_if_empty(conn) -> int:
+    current_scores = int(conn.execute("SELECT COUNT(*) FROM opportunity_scores").fetchone()[0] or 0)
+    if current_scores > 0:
+        return 0
+    snapshot = conn.execute(
+        """
+        SELECT id, score_count
+        FROM opportunity_import_snapshots
+        WHERE score_count > 0
+        ORDER BY archived_at DESC, id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    if not snapshot:
+        return 0
+    snapshot_id = int(snapshot["id"])
+    rows = query_rows(
+        conn,
+        """
+        SELECT
+            product_id, style_no, title, brand, size, score, rating,
+            recommended_buy_qty, max_buy_price, weighted_avg_cost,
+            next_lowest_ask, target_sell_price_low, target_sell_price_high,
+            estimated_profit, estimated_profit_per_pair, estimated_days_to_sell,
+            release_date, release_days, risk_notes, components_json, computed_at
+        FROM opportunity_score_history
+        WHERE snapshot_id = ?
+        """,
+        (snapshot_id,),
+    )
+    restored = 0
+    for row in rows:
+        data = dict(row)
+        conn.execute(
+            """
+            INSERT INTO opportunity_scores (
+                product_id, style_no, title, brand, size, score, rating,
+                recommended_buy_qty, max_buy_price, weighted_avg_cost,
+                next_lowest_ask, target_sell_price_low, target_sell_price_high,
+                estimated_profit, estimated_profit_per_pair, estimated_days_to_sell,
+                risk_notes, components_json, computed_at,
+                release_date, release_days
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(style_no, size) DO UPDATE SET
+                product_id=excluded.product_id,
+                title=excluded.title,
+                brand=excluded.brand,
+                score=excluded.score,
+                rating=excluded.rating,
+                recommended_buy_qty=excluded.recommended_buy_qty,
+                max_buy_price=excluded.max_buy_price,
+                weighted_avg_cost=excluded.weighted_avg_cost,
+                next_lowest_ask=excluded.next_lowest_ask,
+                target_sell_price_low=excluded.target_sell_price_low,
+                target_sell_price_high=excluded.target_sell_price_high,
+                estimated_profit=excluded.estimated_profit,
+                estimated_profit_per_pair=excluded.estimated_profit_per_pair,
+                estimated_days_to_sell=excluded.estimated_days_to_sell,
+                risk_notes=excluded.risk_notes,
+                components_json=excluded.components_json,
+                computed_at=excluded.computed_at,
+                release_date=excluded.release_date,
+                release_days=excluded.release_days
+            """,
+            (
+                data.get("product_id"),
+                data.get("style_no"),
+                data.get("title"),
+                data.get("brand"),
+                data.get("size"),
+                data.get("score"),
+                data.get("rating"),
+                data.get("recommended_buy_qty") or 0,
+                data.get("max_buy_price"),
+                data.get("weighted_avg_cost"),
+                data.get("next_lowest_ask"),
+                data.get("target_sell_price_low"),
+                data.get("target_sell_price_high"),
+                data.get("estimated_profit"),
+                data.get("estimated_profit_per_pair"),
+                data.get("estimated_days_to_sell"),
+                data.get("risk_notes"),
+                data.get("components_json") or "{}",
+                data.get("computed_at") or utc_now(),
+                data.get("release_date"),
+                data.get("release_days"),
+            ),
+        )
+        restored += 1
+    if restored:
+        log_sync(
+            conn,
+            f"已从历史快照 #{snapshot_id} 恢复 {restored} 行机会评分",
+            event_type="opportunity_scores_restored_from_history",
+            details={"snapshot_id": snapshot_id, "restored": restored},
+        )
+    return restored
+
+
 def sync_style_isolated(
     style_no: str,
     *,
@@ -7888,6 +7988,24 @@ def main() -> None:
     if not _require_app_login(settings):
         return
     conn = get_conn()
+    try:
+        restored_scores = restore_opportunity_scores_from_latest_history_if_empty(conn)
+        if restored_scores:
+            conn.commit()
+            bump_data_cache_version()
+            st.session_state["sync_notice"] = f"检测到机会评分为空，已从历史快照恢复 {restored_scores} 行。"
+    except Exception as exc:
+        try:
+            log_sync(
+                conn,
+                f"历史评分恢复失败：{exc}",
+                severity="error",
+                event_type="opportunity_score_restore_error",
+                details={"error": str(exc)},
+            )
+            conn.commit()
+        except Exception:
+            pass
     schedule_startup_core_backup_if_needed(settings)
     _refresh_cache_after_sync_if_needed()
     st.sidebar.title("套利扫描器")

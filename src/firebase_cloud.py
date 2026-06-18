@@ -139,6 +139,48 @@ def _read_table_rows(conn: sqlite3.Connection, table: str) -> list[dict[str, Any
     return [dict(row) for row in rows]
 
 
+def _core_row_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for table in CORE_BACKUP_TABLES:
+        if _table_exists(conn, table):
+            counts[table] = int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] or 0)
+        else:
+            counts[table] = 0
+    return counts
+
+
+def _remote_opportunity_score_count(db, settings) -> int:
+    counts: list[int] = []
+    for root in (_core_backup_root(db, settings), _backup_root(db, settings)):
+        try:
+            meta = root.get()
+            if not meta.exists:
+                continue
+            data = meta.to_dict() or {}
+            row_counts = data.get("row_counts") or {}
+            counts.append(int(row_counts.get("opportunity_scores") or 0))
+        except Exception:
+            continue
+    return max(counts) if counts else 0
+
+
+def _should_skip_destructive_zero_score_backup(db, settings, row_counts: dict[str, int], reason: str) -> bool:
+    local_scores = int(row_counts.get("opportunity_scores") or 0)
+    remote_scores = _remote_opportunity_score_count(db, settings)
+    if local_scores == 0 and remote_scores > 0:
+        write_cloud_event(
+            "backup_skipped_zero_scores",
+            {
+                "reason": reason,
+                "local_opportunity_scores": local_scores,
+                "remote_opportunity_scores": remote_scores,
+                "created_at": utc_now(),
+            },
+        )
+        return True
+    return False
+
+
 def _replace_table_rows(conn: sqlite3.Connection, table: str, rows: list[dict[str, Any]]) -> None:
     if not rows or not _table_exists(conn, table):
         return
@@ -226,10 +268,17 @@ def backup_core_tables_to_firestore(db_path: Path | str, *, reason: str = "manua
     conn.row_factory = sqlite3.Row
     try:
         tables = {table: _read_table_rows(conn, table) for table in CORE_BACKUP_TABLES}
+        row_counts = {table: len(rows) for table, rows in tables.items()}
     finally:
         conn.close()
 
-    row_counts = {table: len(rows) for table, rows in tables.items()}
+    if _should_skip_destructive_zero_score_backup(db, settings, row_counts, reason):
+        return {
+            "ok": False,
+            "message": "Skipped backup: local opportunity_scores is 0 while remote backup has scores",
+            "row_counts": row_counts,
+        }
+
     payload = {"schema": 1, "tables": tables, "row_counts": row_counts}
     meta = _write_chunked_payload(
         _core_backup_root(db, settings),
@@ -349,6 +398,22 @@ def backup_sqlite_to_firestore(db_path: Path | str, *, reason: str = "manual") -
     if db is None:
         return {"ok": False, "message": "Firestore client not initialized"}
 
+    local_counts: dict[str, int]
+    count_conn = sqlite3.connect(path, timeout=60)
+    count_conn.row_factory = sqlite3.Row
+    try:
+        init_db(count_conn)
+        local_counts = _core_row_counts(count_conn)
+    finally:
+        count_conn.close()
+
+    if _should_skip_destructive_zero_score_backup(db, settings, local_counts, reason):
+        return {
+            "ok": False,
+            "message": "Skipped SQLite backup: local opportunity_scores is 0 while remote backup has scores",
+            "row_counts": local_counts,
+        }
+
     with tempfile.TemporaryDirectory() as tmp_dir:
         copy_path = Path(tmp_dir) / "stockx_arbitrage.sqlite"
         source = sqlite3.connect(path, timeout=60)
@@ -389,6 +454,7 @@ def backup_sqlite_to_firestore(db_path: Path | str, *, reason: str = "manual") -
         "compressed_size": len(compressed),
         "encoded_size": len(encoded),
         "chunk_count": len(chunks),
+        "row_counts": local_counts,
     }
     root.set(meta)
     write_cloud_event("sqlite_backup_saved", meta)
