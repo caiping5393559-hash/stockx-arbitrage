@@ -93,6 +93,24 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_sku_items_style_no ON sku_items(style_no);
 
+        CREATE TABLE IF NOT EXISTS stockx_style_sync_status (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            import_id INTEGER,
+            style_no TEXT NOT NULL,
+            status TEXT NOT NULL,
+            product_id TEXT,
+            sizes_count INTEGER DEFAULT 0,
+            sales_rows INTEGER DEFAULT 0,
+            ask_rows INTEGER DEFAULT 0,
+            bid_rows INTEGER DEFAULT 0,
+            error_count INTEGER DEFAULT 0,
+            message TEXT,
+            updated_at TEXT NOT NULL,
+            UNIQUE(import_id, style_no)
+        );
+        CREATE INDEX IF NOT EXISTS idx_stockx_style_sync_status_style
+            ON stockx_style_sync_status(style_no);
+
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             product_id TEXT,

@@ -4347,26 +4347,51 @@ def render_opportunity_snapshot_history(conn, settings) -> None:
 
 
 def load_incomplete_stockx_skus(conn) -> list[str]:
+    active_import = conn.execute(
+        """
+        SELECT id, imported_at
+        FROM sku_imports
+        WHERE source_name IN ('stockx_top1000', 'manual')
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    active_import_id = int(active_import["id"]) if active_import else None
     rows = query_rows(
         conn,
         """
         WITH imported AS (
             SELECT
-                style_no,
-                MIN(COALESCE(rank, 999999)) AS import_rank
-            FROM sku_items
-            WHERE style_no IS NOT NULL AND TRIM(style_no) != ''
+                si.style_no,
+                MIN(COALESCE(si.rank, 999999)) AS import_rank
+            FROM sku_items si
+            WHERE (? IS NULL OR si.import_id = ?)
+              AND si.style_no IS NOT NULL
+              AND TRIM(si.style_no) != ''
+            GROUP BY si.style_no
+        ),
+        completed_attempt AS (
+            SELECT style_no
+            FROM stockx_style_sync_status
+            WHERE status IN ('done', 'error', 'timeout')
+              AND (? IS NULL OR import_id = ?)
+              AND style_no IS NOT NULL
+              AND TRIM(style_no) != ''
             GROUP BY style_no
         )
         SELECT i.style_no
         FROM imported i
-        WHERE NOT EXISTS (SELECT 1 FROM products p WHERE p.style_no = i.style_no)
-           OR NOT EXISTS (SELECT 1 FROM product_sizes ps WHERE ps.style_no = i.style_no)
-           OR NOT EXISTS (SELECT 1 FROM ask_depth a WHERE a.style_no = i.style_no)
-           OR NOT EXISTS (SELECT 1 FROM sales_history s WHERE s.style_no = i.style_no)
-           OR NOT EXISTS (SELECT 1 FROM opportunity_scores o WHERE o.style_no = i.style_no)
+        WHERE NOT EXISTS (SELECT 1 FROM completed_attempt ca WHERE ca.style_no = i.style_no)
+          AND (
+               NOT EXISTS (SELECT 1 FROM products p WHERE p.style_no = i.style_no)
+            OR NOT EXISTS (SELECT 1 FROM product_sizes ps WHERE ps.style_no = i.style_no)
+            OR NOT EXISTS (SELECT 1 FROM ask_depth a WHERE a.style_no = i.style_no)
+            OR NOT EXISTS (SELECT 1 FROM sales_history s WHERE s.style_no = i.style_no)
+            OR NOT EXISTS (SELECT 1 FROM opportunity_scores o WHERE o.style_no = i.style_no)
+          )
         ORDER BY i.import_rank, i.style_no
         """,
+        (active_import_id, active_import_id, active_import_id, active_import_id),
     )
     return [str(row["style_no"]) for row in rows]
 

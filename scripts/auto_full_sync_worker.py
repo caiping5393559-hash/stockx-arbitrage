@@ -195,6 +195,64 @@ def _load_imported_styles(conn) -> list[str]:
     return [str(row["style_no"]).strip().upper() for row in rows if row["style_no"]]
 
 
+def _latest_stockx_import_id(conn) -> int | None:
+    row = conn.execute(
+        """
+        SELECT id
+        FROM sku_imports
+        WHERE source_name IN ('stockx_top1000', 'manual')
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    return int(row["id"]) if row else None
+
+
+def _record_style_sync_status(
+    conn: sqlite3.Connection,
+    *,
+    import_id: int | None,
+    style_no: str,
+    status: str,
+    result: dict[str, Any] | None = None,
+    message: str | None = None,
+) -> None:
+    result = result or {}
+    errors = list(result.get("errors") or [])
+    conn.execute(
+        """
+        INSERT INTO stockx_style_sync_status (
+            import_id, style_no, status, product_id, sizes_count,
+            sales_rows, ask_rows, bid_rows, error_count, message, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(import_id, style_no) DO UPDATE SET
+            status=excluded.status,
+            product_id=excluded.product_id,
+            sizes_count=excluded.sizes_count,
+            sales_rows=excluded.sales_rows,
+            ask_rows=excluded.ask_rows,
+            bid_rows=excluded.bid_rows,
+            error_count=excluded.error_count,
+            message=excluded.message,
+            updated_at=excluded.updated_at
+        """,
+        (
+            import_id,
+            style_no,
+            status,
+            result.get("product_id"),
+            int(result.get("sizes") or 0),
+            int(result.get("sales_rows") or 0),
+            int(result.get("ask_rows") or 0),
+            int(result.get("bid_rows") or 0),
+            len(errors),
+            message or (errors[0] if errors else status),
+            _now().isoformat(timespec="seconds"),
+        ),
+    )
+
+
 def _sync_one_style(db_path: Path, style_no: str) -> dict[str, Any]:
     worker_conn = connect(db_path)
     init_db(worker_conn)
@@ -277,6 +335,7 @@ def _run_full_sync() -> None:
     conn = connect(settings.db_path)
     init_db(conn)
     try:
+        import_id = _latest_stockx_import_id(conn)
         styles = _load_imported_styles(conn)
         started = _now()
         marker.update(
@@ -475,6 +534,13 @@ def _run_full_sync() -> None:
                 _kill_process(proc)
                 log_tail = _read_tail(log_path)
                 errors += 1
+                _record_style_sync_status(
+                    conn,
+                    import_id=import_id,
+                    style_no=style_no,
+                    status="timeout",
+                    message=f"单货号超过 {STYLE_SYNC_HARD_TIMEOUT_SECONDS} 秒，已跳过",
+                )
                 log_sync(
                     conn,
                     f"自动全量同步 {style_no} 超时，已杀掉该货号进程并继续下一个",
@@ -496,6 +562,13 @@ def _run_full_sync() -> None:
                 if timed_out:
                     log_tail = _read_tail(log_path)
                     errors += 1
+                    _record_style_sync_status(
+                        conn,
+                        import_id=import_id,
+                        style_no=style_no,
+                        status="timeout",
+                        message="单货号结束读取超时，已跳过",
+                    )
                     log_sync(
                         conn,
                         f"自动全量同步 {style_no} 结束读取超时，已杀掉该货号进程并继续下一个",
@@ -513,6 +586,14 @@ def _run_full_sync() -> None:
                     if log_tail:
                         style_errors.append(log_tail)
                     errors += len(style_errors)
+                    _record_style_sync_status(
+                        conn,
+                        import_id=import_id,
+                        style_no=style_no,
+                        status="error" if style_errors else "done",
+                        result=result,
+                        message=style_errors[0] if style_errors else "done",
+                    )
                     if style_errors:
                         log_sync(
                             conn,
