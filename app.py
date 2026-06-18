@@ -3424,6 +3424,44 @@ def _load_all_imported_styles_for_auto_sync(db_path: Path) -> list[str]:
         conn.close()
 
 
+def _run_stockx_full_sync_thread(source: str) -> None:
+    try:
+        from scripts.auto_full_sync_worker import _run_full_sync
+
+        _run_full_sync()
+    except Exception as exc:  # noqa: BLE001
+        marker = _read_auto_hourly_marker()
+        error_message = f"StockX后台线程失败：{exc}"
+        marker.update(
+            {
+                "last_status": "error",
+                "last_error": error_message,
+                "last_traceback": traceback.format_exc(limit=8),
+                "last_finished_at": datetime.utcnow().isoformat(timespec="seconds"),
+                "last_finished_ts": datetime.utcnow().timestamp(),
+                "last_message": error_message,
+                "last_worker_source": source,
+            }
+        )
+        _write_auto_hourly_marker(marker)
+        _write_sync_state_file(
+            {
+                "job_id": marker.get("active_job_id") or "",
+                "status": "error",
+                "message": error_message,
+                "error": error_message,
+                "traceback": marker.get("last_traceback"),
+                "progress": 0.0,
+                "completed": int(marker.get("completed") or 0),
+                "total": int(marker.get("total") or 0),
+                "current_phase": "worker线程失败",
+                "current_style": marker.get("current_style"),
+                "current_endpoint": None,
+                "finished_at": datetime.utcnow().isoformat(timespec="seconds"),
+            }
+        )
+
+
 def start_stockx_full_sync_worker_process(source: str = "manual_resume") -> dict[str, Any]:
     python_exe = Path(sys.executable)
     if not python_exe.exists():
@@ -3473,6 +3511,28 @@ def start_stockx_full_sync_worker_process(source: str = "manual_resume") -> dict
         }
     )
     _write_auto_hourly_marker(marker)
+    if os.environ.get("RENDER") or os.environ.get("RENDER_SERVICE_ID"):
+        try:
+            thread = threading.Thread(
+                target=_run_stockx_full_sync_thread,
+                args=(source,),
+                name=f"stockx-full-sync-{source}",
+                daemon=True,
+            )
+            thread.start()
+            return {"started": True, "started_at": now.isoformat(timespec="seconds"), "mode": "thread"}
+        except Exception as exc:  # noqa: BLE001
+            marker.update(
+                {
+                    "last_status": "error",
+                    "last_error": str(exc),
+                    "last_finished_at": datetime.utcnow().isoformat(timespec="seconds"),
+                    "last_finished_ts": datetime.utcnow().timestamp(),
+                    "last_message": f"StockX后台线程启动失败：{exc}",
+                }
+            )
+            _write_auto_hourly_marker(marker)
+            return {"started": False, "reason": str(exc)}
     try:
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         log_dir = BASE_DIR / "data" / "worker_logs"
