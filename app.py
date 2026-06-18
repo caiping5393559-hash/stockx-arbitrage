@@ -49,6 +49,7 @@ from src.firebase_cloud import (
     backup_sqlite_to_firestore,
     firebase_status,
     restore_core_tables_if_needed,
+    restore_packaged_stockx_seed_if_empty,
     restore_sqlite_backup_if_needed,
 )
 from src.importer import import_sku_file, list_imported_skus
@@ -8325,6 +8326,10 @@ def main() -> None:
     try:
         restore_sqlite_backup_if_needed(Path(settings.db_path))
         restore_core_tables_if_needed(Path(settings.db_path))
+        restore_packaged_stockx_seed_if_empty(
+            Path(settings.db_path),
+            BASE_DIR / "sample_data" / "stockx_current_seed.json.gz",
+        )
     except Exception:
         pass
     if not _require_app_login(settings):

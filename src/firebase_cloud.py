@@ -134,6 +134,12 @@ STOCKX_CORE_BACKUP_TABLES = (
 )
 
 
+def _count_table_rows(conn: sqlite3.Connection, table: str) -> int:
+    if not _table_exists(conn, table):
+        return 0
+    return int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] or 0)
+
+
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     row = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
@@ -206,16 +212,37 @@ def _should_skip_destructive_zero_score_backup(db, settings, row_counts: dict[st
 def _replace_table_rows(conn: sqlite3.Connection, table: str, rows: list[dict[str, Any]]) -> None:
     if not rows or not _table_exists(conn, table):
         return
-    columns = [str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
-    valid_rows = [{key: value for key, value in row.items() if key in columns} for row in rows]
-    valid_rows = [row for row in valid_rows if row]
+    column_info = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    columns = [str(row[1]) for row in column_info]
+    required_defaults: dict[str, Any] = {}
+    for cid, name, col_type, not_null, default_value, primary_key in column_info:
+        if primary_key or not not_null or default_value is not None:
+            continue
+        column = str(name)
+        lowered = column.lower()
+        type_name = str(col_type or "").upper()
+        if lowered.endswith("_json"):
+            required_defaults[column] = "[]" if lowered in {"raw_table_json"} else "{}"
+        elif "INT" in type_name:
+            required_defaults[column] = 0
+        elif any(token in type_name for token in ("REAL", "FLOA", "DOUB", "NUM")):
+            required_defaults[column] = 0.0
+        else:
+            required_defaults[column] = ""
+    valid_rows = []
+    for row in rows:
+        valid_row = {key: value for key, value in row.items() if key in columns}
+        for key, value in required_defaults.items():
+            valid_row.setdefault(key, value)
+        if valid_row:
+            valid_rows.append(valid_row)
     if not valid_rows:
         return
     conn.execute(f"DELETE FROM {table}")
     for row in valid_rows:
         keys = list(row.keys())
         placeholders = ",".join("?" for _ in keys)
-        quoted = ",".join(keys)
+        quoted = ",".join(f'"{key}"' for key in keys)
         conn.execute(
             f"INSERT OR REPLACE INTO {table} ({quoted}) VALUES ({placeholders})",
             [row[key] for key in keys],
@@ -365,6 +392,65 @@ def restore_core_tables_if_needed(db_path: Path | str) -> bool:
         "core_backup_restored",
         {"db_path": str(path), "backup_updated_at": meta_data.get("updated_at")},
     )
+    return True
+
+
+def restore_packaged_stockx_seed_if_empty(db_path: Path | str, seed_path: Path | str) -> bool:
+    """Restore the bundled StockX source/results snapshot only when cloud SQLite is empty."""
+    seed = Path(seed_path)
+    if not seed.exists():
+        return False
+
+    path = Path(db_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    conn = sqlite3.connect(path, timeout=60)
+    conn.row_factory = sqlite3.Row
+    try:
+        init_db(conn)
+        existing_imports = _count_table_rows(conn, "sku_imports")
+        existing_items = _count_table_rows(conn, "sku_items")
+        existing_scores = _count_table_rows(conn, "opportunity_scores")
+        if existing_imports or existing_items or existing_scores:
+            return False
+    finally:
+        conn.close()
+
+    with gzip.open(seed, "rt", encoding="utf-8") as file:
+        payload = json.load(file)
+    tables = payload.get("tables") or {}
+    row_counts = payload.get("row_counts") or {}
+    if int(row_counts.get("sku_items") or 0) <= 0 or int(row_counts.get("opportunity_scores") or 0) <= 0:
+        return False
+
+    conn = sqlite3.connect(path, timeout=60)
+    conn.row_factory = sqlite3.Row
+    try:
+        init_db(conn)
+        conn.execute("BEGIN")
+        for table in STOCKX_CORE_BACKUP_TABLES:
+            rows = tables.get(table) or []
+            if isinstance(rows, list):
+                _replace_table_rows(conn, table, rows)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    try:
+        write_cloud_event(
+            "packaged_stockx_seed_restored",
+            {
+                "db_path": str(path),
+                "seed_path": str(seed),
+                "row_counts": {table: int(row_counts.get(table) or 0) for table in STOCKX_CORE_BACKUP_TABLES},
+                "created_at": utc_now(),
+            },
+        )
+    except Exception:
+        pass
     return True
 
 
