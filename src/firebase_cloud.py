@@ -107,6 +107,10 @@ def _core_backup_root(db, settings):
     return db.collection(settings.firebase_collection_prefix).document("core_backup")
 
 
+def _score_watermark_root(db, settings):
+    return db.collection(settings.firebase_collection_prefix).document("stockx_score_watermark")
+
+
 CORE_BACKUP_TABLES = (
     "sku_imports",
     "sku_import_sheets",
@@ -171,6 +175,13 @@ def _core_row_counts(conn: sqlite3.Connection) -> dict[str, int]:
 
 def _remote_opportunity_score_count(db, settings) -> int:
     counts: list[int] = []
+    try:
+        watermark = _score_watermark_root(db, settings).get()
+        if watermark.exists:
+            data = watermark.to_dict() or {}
+            counts.append(int(data.get("opportunity_scores") or 0))
+    except Exception:
+        pass
     for root in (_core_backup_root(db, settings), _backup_root(db, settings)):
         try:
             meta = root.get()
@@ -182,6 +193,32 @@ def _remote_opportunity_score_count(db, settings) -> int:
         except Exception:
             continue
     return max(counts) if counts else 0
+
+
+def _save_score_watermark(db, settings, row_counts: dict[str, int], reason: str) -> None:
+    local_scores = int(row_counts.get("opportunity_scores") or 0)
+    if local_scores <= 0:
+        return
+    try:
+        doc = _score_watermark_root(db, settings)
+        current = doc.get()
+        current_scores = 0
+        if current.exists:
+            current_scores = int((current.to_dict() or {}).get("opportunity_scores") or 0)
+        if local_scores > current_scores:
+            doc.set(
+                {
+                    "opportunity_scores": local_scores,
+                    "reason": reason,
+                    "updated_at": utc_now(),
+                },
+                merge=True,
+            )
+    except Exception as exc:
+        write_cloud_event(
+            "score_watermark_save_failed",
+            {"reason": reason, "error": str(exc), "created_at": utc_now()},
+        )
 
 
 def _remote_core_opportunity_score_count(db, settings) -> int:
@@ -350,6 +387,7 @@ def backup_core_tables_to_firestore(db_path: Path | str, *, reason: str = "manua
         payload,
         {"reason": reason, "row_counts": row_counts},
     )
+    _save_score_watermark(db, settings, row_counts, reason)
     write_cloud_event("core_backup_saved", meta)
     return {"ok": True, **meta}
 
@@ -384,6 +422,19 @@ def restore_core_tables_if_needed(db_path: Path | str) -> bool:
     remote_imports = int(remote_counts.get("sku_imports") or 0)
     remote_items = int(remote_counts.get("sku_items") or 0)
     remote_scores = int(remote_counts.get("opportunity_scores") or 0)
+    remote_score_floor = _remote_opportunity_score_count(db, settings)
+    if existing_scores > remote_scores and remote_scores < remote_score_floor:
+        write_cloud_event(
+            "core_restore_skipped_regressive_scores",
+            {
+                "local_opportunity_scores": existing_scores,
+                "core_opportunity_scores": remote_scores,
+                "remote_score_floor": remote_score_floor,
+                "backup_updated_at": meta_data.get("updated_at"),
+                "created_at": utc_now(),
+            },
+        )
+        return False
     if existing_imports >= remote_imports and existing_items >= remote_items and existing_scores >= remote_scores:
         return False
     tables_to_restore = CORE_BACKUP_TABLES if not existing_goat else STOCKX_CORE_BACKUP_TABLES
@@ -519,12 +570,14 @@ def restore_sqlite_backup_if_needed(db_path: Path | str) -> bool:
         return False
     sqlite_scores = int(sqlite_counts.get("opportunity_scores") or 0)
     core_scores = _remote_core_opportunity_score_count(db, settings)
-    if _should_skip_regressive_sqlite_restore(sqlite_scores, core_scores):
+    remote_score_floor = _remote_opportunity_score_count(db, settings)
+    if _should_skip_regressive_sqlite_restore(sqlite_scores, max(core_scores, remote_score_floor)):
         write_cloud_event(
             "sqlite_restore_skipped_regressive_scores",
             {
                 "sqlite_opportunity_scores": sqlite_scores,
                 "core_opportunity_scores": core_scores,
+                "remote_score_floor": remote_score_floor,
                 "backup_updated_at": meta_data.get("updated_at"),
                 "created_at": utc_now(),
             },
@@ -629,5 +682,6 @@ def backup_sqlite_to_firestore(db_path: Path | str, *, reason: str = "manual") -
         "row_counts": local_counts,
     }
     root.set(meta)
+    _save_score_watermark(db, settings, local_counts, reason)
     write_cloud_event("sqlite_backup_saved", meta)
     return {"ok": True, **meta}

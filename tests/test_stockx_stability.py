@@ -7,6 +7,8 @@ import pandas as pd
 from src.db import init_db
 from src.firebase_cloud import (
     CORE_BACKUP_TABLES,
+    _remote_opportunity_score_count,
+    _save_score_watermark,
     _should_skip_regressive_score_backup,
     _should_skip_regressive_sqlite_restore,
 )
@@ -25,6 +27,12 @@ class _FakeDoc:
 
     def to_dict(self) -> dict:
         return self._data
+
+    def set(self, data: dict, merge: bool = False) -> None:
+        if merge:
+            self._data.update(data)
+        else:
+            self._data = data
 
 
 class _FakeCollection:
@@ -129,6 +137,32 @@ class StockxStabilityTests(unittest.TestCase):
                 "unit",
             )
         )
+
+    def test_remote_score_count_uses_monotonic_watermark(self) -> None:
+        fake_db = _FakeFirestore(
+            {
+                "stockx_score_watermark": _FakeDoc({"opportunity_scores": 2537}),
+                "core_backup": _FakeDoc({"row_counts": {"opportunity_scores": 1598}}),
+                "sqlite_backup": _FakeDoc({"row_counts": {"opportunity_scores": 1598}}),
+            }
+        )
+        self.assertEqual(_remote_opportunity_score_count(fake_db, _FakeSettings()), 2537)
+        self.assertTrue(
+            _should_skip_regressive_score_backup(
+                fake_db,
+                _FakeSettings(),
+                {"opportunity_scores": 1836},
+                "unit",
+            )
+        )
+
+    def test_score_watermark_only_moves_up(self) -> None:
+        watermark = _FakeDoc({"opportunity_scores": 1800})
+        fake_db = _FakeFirestore({"stockx_score_watermark": watermark})
+        _save_score_watermark(fake_db, _FakeSettings(), {"opportunity_scores": 1700}, "unit")
+        self.assertEqual(watermark.to_dict()["opportunity_scores"], 1800)
+        _save_score_watermark(fake_db, _FakeSettings(), {"opportunity_scores": 1900}, "unit")
+        self.assertEqual(watermark.to_dict()["opportunity_scores"], 1900)
 
     def test_progress_watermark_table_is_in_cloud_backup_scope(self) -> None:
         self.assertIn("stockx_import_progress_watermarks", CORE_BACKUP_TABLES)
