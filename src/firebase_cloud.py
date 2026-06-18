@@ -164,6 +164,18 @@ def _remote_opportunity_score_count(db, settings) -> int:
     return max(counts) if counts else 0
 
 
+def _remote_core_opportunity_score_count(db, settings) -> int:
+    try:
+        meta = _core_backup_root(db, settings).get()
+        if not meta.exists:
+            return 0
+        data = meta.to_dict() or {}
+        row_counts = data.get("row_counts") or {}
+        return int(row_counts.get("opportunity_scores") or 0)
+    except Exception:
+        return 0
+
+
 def _should_skip_destructive_zero_score_backup(db, settings, row_counts: dict[str, int], reason: str) -> bool:
     local_scores = int(row_counts.get("opportunity_scores") or 0)
     remote_scores = _remote_opportunity_score_count(db, settings)
@@ -357,6 +369,20 @@ def restore_sqlite_backup_if_needed(db_path: Path | str) -> bool:
     meta_data = meta.to_dict() or {}
     chunk_count = int(meta_data.get("chunk_count") or 0)
     if chunk_count <= 0:
+        return False
+    sqlite_counts = meta_data.get("row_counts") or {}
+    sqlite_scores = int(sqlite_counts.get("opportunity_scores") or 0)
+    core_scores = _remote_core_opportunity_score_count(db, settings)
+    if sqlite_scores == 0 and core_scores > 0:
+        write_cloud_event(
+            "sqlite_restore_skipped_zero_scores",
+            {
+                "sqlite_opportunity_scores": sqlite_scores,
+                "core_opportunity_scores": core_scores,
+                "backup_updated_at": meta_data.get("updated_at"),
+                "created_at": utc_now(),
+            },
+        )
         return False
 
     encoded_parts: list[str] = []
