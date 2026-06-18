@@ -8385,6 +8385,7 @@ def main() -> None:
         except Exception:
             pass
     schedule_startup_core_backup_if_needed(settings)
+    ensure_auto_hourly_full_sync_scheduler()
     _refresh_cache_after_sync_if_needed()
     st.sidebar.title("套利扫描器")
     if settings.app_login_enabled:
