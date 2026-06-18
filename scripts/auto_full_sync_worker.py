@@ -268,6 +268,7 @@ def _record_style_sync_status(
 
 
 def _sync_one_style(db_path: Path, style_no: str) -> dict[str, Any]:
+    settings = get_settings()
     worker_conn = connect(db_path)
     init_db(worker_conn)
     try:
@@ -279,13 +280,27 @@ def _sync_one_style(db_path: Path, style_no: str) -> dict[str, Any]:
             include_size_endpoints=True,
             reset_snapshot=True,
         )
+        score_rows = 0
+        score_error = None
+        try:
+            worker_conn.commit()
+            score_rows = compute_and_store_opportunities(
+                worker_conn,
+                fee_rate=settings.estimated_seller_fee_rate,
+                sales_fraction=settings.buy_depth_sales_fraction,
+                style_nos=[style_no],
+            )
+        except Exception as exc:  # noqa: BLE001
+            worker_conn.rollback()
+            score_error = f"score_failed: {exc}"
         return {
             "style_no": style_no,
             "sizes": len(summary.sizes),
             "sales_rows": summary.sales_rows,
             "ask_rows": summary.ask_rows,
             "bid_rows": summary.bid_rows,
-            "errors": summary.errors or [],
+            "score_rows": score_rows,
+            "errors": [*(summary.errors or []), *([score_error] if score_error else [])],
         }
     finally:
         worker_conn.close()
@@ -501,9 +516,13 @@ def _run_full_sync() -> None:
             error_message: str | None = None,
             log_tail: str = "",
         ) -> None:
-            nonlocal completed, errors
+            nonlocal completed, errors, recomputed
             completed += 1
-            pending_recompute.append(style_no)
+            result_score_rows = int((result or {}).get("score_rows") or 0)
+            if result_score_rows > 0:
+                recomputed += result_score_rows
+            else:
+                pending_recompute.append(style_no)
             if timed_out:
                 errors += 1
                 _record_style_sync_status(
@@ -582,7 +601,8 @@ def _run_full_sync() -> None:
             # Otherwise SQLite can keep the writer lock on the main connection and the
             # incremental scoring pass silently waits/returns without updating scores.
             conn.commit()
-            try_recompute_pending(style_no)
+            if pending_recompute:
+                try_recompute_pending(style_no)
 
         inline_mode = os.environ.get("STOCKX_INLINE_STYLE_WORKER") == "1"
         if inline_mode:
