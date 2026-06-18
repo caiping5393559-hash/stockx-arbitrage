@@ -3530,7 +3530,7 @@ def _auto_hourly_full_sync_loop() -> None:
                     last_partial_ts = _timestamp_from_marker(marker.get("last_partial_resume_ts"))
                     partial_retry_due = (
                         not last_partial_ts
-                        or datetime.utcnow().timestamp() - last_partial_ts >= 10 * 60
+                        or datetime.utcnow().timestamp() - last_partial_ts >= JOB_LOCK_STALE_SECONDS
                     )
                     state_blocks_resume = state.get("status") == "running"
                     resume_is_due = (
@@ -3574,17 +3574,24 @@ def _auto_hourly_full_sync_loop() -> None:
                                 "last_checked_at": now.isoformat(timespec="seconds"),
                                 "last_checked_ts": now.timestamp(),
                                 "last_style_count": len(imported_styles),
-                                "last_partial_resume_key": partial_resume_key,
-                                "last_partial_resume_at": now.isoformat(timespec="seconds"),
-                                "last_partial_resume_ts": now.timestamp(),
                             }
                         )
                         if worker.get("started"):
+                            updated.update(
+                                {
+                                    "last_partial_resume_key": partial_resume_key,
+                                    "last_partial_resume_at": now.isoformat(timespec="seconds"),
+                                    "last_partial_resume_ts": now.timestamp(),
+                                }
+                            )
                             updated["last_message"] = (
                                 f"检测到当前批次还有 {incomplete_count} 个未完成货号，"
                                 f"已自动启动后台worker继续补跑：{len(imported_styles)} 个货号"
                             )
                         else:
+                            updated.pop("last_partial_resume_key", None)
+                            updated.pop("last_partial_resume_at", None)
+                            updated.pop("last_partial_resume_ts", None)
                             updated["last_message"] = f"检测到未完成货号，但worker未启动：{worker.get('reason') or '-'}"
                         _write_auto_hourly_marker(updated)
                         time_module.sleep(AUTO_HOURLY_SYNC_POLL_SECONDS)
