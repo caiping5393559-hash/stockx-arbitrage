@@ -6347,14 +6347,24 @@ def page_opportunity_board(conn, settings) -> None:
             ("待补跑", len(incomplete_styles)),
         ]
     )
+    retry_now_ts = datetime.utcnow().timestamp()
+    auto_retry_seconds = 5 * 60
+    zero_retry_key = f"_opp_zero_score_recovery_ts_{active_import_id}"
+    partial_retry_key = f"_opp_partial_resume_ts_{active_import_id}"
+    zero_retry_due = (
+        retry_now_ts - float(st.session_state.get(zero_retry_key, 0) or 0)
+    ) >= auto_retry_seconds
+    partial_retry_due = (
+        retry_now_ts - float(st.session_state.get(partial_retry_key, 0) or 0)
+    ) >= auto_retry_seconds
     if (
         active_import_id
         and product_styles > 0
         and scored_count == 0
         and not job_running
-        and st.session_state.get("_opp_zero_score_recovery_import_id") != active_import_id
+        and zero_retry_due
     ):
-        st.session_state["_opp_zero_score_recovery_import_id"] = active_import_id
+        st.session_state[zero_retry_key] = retry_now_ts
         if incomplete_styles:
             worker = start_stockx_full_sync_worker_process("zero_score_auto_resume")
             if worker.get("started"):
@@ -6379,9 +6389,9 @@ def page_opportunity_board(conn, settings) -> None:
         and incomplete_styles
         and scored_count > 0
         and not job_running
-        and st.session_state.get("_opp_partial_resume_import_id") != active_import_id
+        and partial_retry_due
     ):
-        st.session_state["_opp_partial_resume_import_id"] = active_import_id
+        st.session_state[partial_retry_key] = retry_now_ts
         worker = start_stockx_full_sync_worker_process("partial_auto_resume")
         if worker.get("started"):
             st.session_state["sync_notice"] = (
