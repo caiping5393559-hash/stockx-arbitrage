@@ -855,6 +855,16 @@ def _write_json_path(path: Path, data: dict[str, Any]) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
 
 
+def _read_text_tail(path: Path, max_chars: int = 4000) -> str:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    return text[-max_chars:]
+
+
 def _write_sync_state_file(state: dict[str, Any]) -> None:
     try:
         SYNC_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -3469,7 +3479,9 @@ def start_stockx_full_sync_worker_process(source: str = "manual_resume") -> dict
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"stockx_full_sync_{now.strftime('%Y%m%d%H%M%S')}_{job_id if 'job_id' in locals() else source}.log"
         log_handle = log_path.open("a", encoding="utf-8", errors="replace")
-        subprocess.Popen(
+        worker_env = os.environ.copy()
+        worker_env["PYTHONUNBUFFERED"] = "1"
+        proc = subprocess.Popen(
             [
                 str(python_exe),
                 "-c",
@@ -3480,7 +3492,47 @@ def start_stockx_full_sync_worker_process(source: str = "manual_resume") -> dict
             stdout=log_handle,
             stderr=subprocess.STDOUT,
             creationflags=creationflags,
+            env=worker_env,
         )
+        time_module.sleep(2)
+        exit_code = proc.poll()
+        if exit_code is not None:
+            try:
+                log_handle.close()
+            except Exception:
+                pass
+            log_tail = _read_text_tail(log_path)
+            error_message = f"StockX后台worker启动后立即退出，退出码 {exit_code}"
+            marker.update(
+                {
+                    "last_status": "error",
+                    "last_error": error_message,
+                    "last_traceback": log_tail,
+                    "last_finished_at": datetime.utcnow().isoformat(timespec="seconds"),
+                    "last_finished_ts": datetime.utcnow().timestamp(),
+                    "last_message": error_message,
+                    "completed": int(marker.get("completed") or 0),
+                    "recomputed": int(marker.get("recomputed") or 0),
+                }
+            )
+            _write_auto_hourly_marker(marker)
+            _write_sync_state_file(
+                {
+                    "job_id": marker.get("active_job_id") or "",
+                    "status": "error",
+                    "message": error_message,
+                    "error": error_message,
+                    "traceback": log_tail,
+                    "progress": 0.0,
+                    "completed": 0,
+                    "total": 0,
+                    "current_phase": "worker启动失败",
+                    "current_style": None,
+                    "current_endpoint": None,
+                    "finished_at": datetime.utcnow().isoformat(timespec="seconds"),
+                }
+            )
+            return {"started": False, "reason": error_message, "log_tail": log_tail}
         log_handle.close()
         return {"started": True, "started_at": now.isoformat(timespec="seconds")}
     except Exception as exc:  # noqa: BLE001
