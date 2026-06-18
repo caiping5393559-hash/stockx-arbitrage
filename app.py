@@ -2895,8 +2895,22 @@ def _auto_hourly_status_snapshot(settings) -> dict[str, Any]:
     finished_ts = _timestamp_from_marker(marker.get("last_finished_ts")) or _timestamp_from_marker(marker.get("last_finished_at"))
     valid_finished_ts = finished_ts if finished_ts and (not started_ts or finished_ts >= started_ts) else None
     now_ts = datetime.utcnow().timestamp()
+    last_touch_ts = (
+        _timestamp_from_marker(marker.get("last_checked_ts"))
+        or _timestamp_from_marker(marker.get("last_checked_at"))
+        or started_ts
+    )
+    stale_no_progress = (
+        last_status == "running"
+        and bool(last_touch_ts)
+        and now_ts - float(last_touch_ts) >= 10 * 60
+    )
 
-    stale_running = last_status == "running" and (not lock_exists or (total > 0 and completed >= total))
+    stale_running = last_status == "running" and (
+        not lock_exists
+        or (total > 0 and completed >= total)
+        or stale_no_progress
+    )
     running = last_status == "running" and bool(active_job_id) and lock_exists and not stale_running
     if running:
         status_label = "正在跑"
@@ -3406,7 +3420,28 @@ def start_stockx_full_sync_worker_process(source: str = "manual_resume") -> dict
         return {"started": False, "reason": "missing auto_full_sync_worker.py"}
     marker = _read_auto_hourly_marker()
     if str(marker.get("last_status") or "") == "running" and JOB_LOCK_PATH.exists():
-        return {"started": True, "queued": True, "reason": "当前StockX任务已在运行"}
+        now_ts = datetime.utcnow().timestamp()
+        last_touch_ts = (
+            _timestamp_from_marker(marker.get("last_checked_ts"))
+            or _timestamp_from_marker(marker.get("last_checked_at"))
+            or _timestamp_from_marker(marker.get("last_started_ts"))
+            or _timestamp_from_marker(marker.get("last_started_at"))
+        )
+        if last_touch_ts and now_ts - float(last_touch_ts) >= 10 * 60:
+            try:
+                JOB_LOCK_PATH.unlink(missing_ok=True)
+            except Exception:
+                return {"started": False, "reason": "旧任务超过10分钟无进展，但旧锁释放失败"}
+            marker.update(
+                {
+                    "last_status": "stale",
+                    "last_message": "旧StockX后台任务超过10分钟无进展，已释放旧锁并准备重启。",
+                    "last_error": "旧任务超过10分钟无进展",
+                }
+            )
+            _write_auto_hourly_marker(marker)
+        else:
+            return {"started": True, "queued": True, "reason": "当前StockX任务已在运行"}
     now = datetime.utcnow()
     marker.update(
         {
@@ -3482,7 +3517,16 @@ def _auto_hourly_full_sync_loop() -> None:
                         conn.close()
                     partial_resume_key = f"{active_import_id}:{score_count}:{incomplete_count}"
                     last_partial_key = str(marker.get("last_partial_resume_key") or "")
-                    if score_count > 0 and incomplete_count > 0 and partial_resume_key != last_partial_key:
+                    last_partial_ts = _timestamp_from_marker(marker.get("last_partial_resume_ts"))
+                    partial_retry_due = (
+                        not last_partial_ts
+                        or datetime.utcnow().timestamp() - last_partial_ts >= 10 * 60
+                    )
+                    if (
+                        score_count > 0
+                        and incomplete_count > 0
+                        and (partial_resume_key != last_partial_key or partial_retry_due)
+                    ):
                         worker = start_stockx_full_sync_worker_process("scheduler_partial_auto_resume")
                         now = datetime.utcnow()
                         updated = _read_auto_hourly_marker()
@@ -3494,6 +3538,8 @@ def _auto_hourly_full_sync_loop() -> None:
                                 "last_checked_ts": now.timestamp(),
                                 "last_style_count": len(imported_styles),
                                 "last_partial_resume_key": partial_resume_key,
+                                "last_partial_resume_at": now.isoformat(timespec="seconds"),
+                                "last_partial_resume_ts": now.timestamp(),
                             }
                         )
                         if worker.get("started"):
