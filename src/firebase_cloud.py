@@ -323,6 +323,13 @@ def backup_core_tables_to_firestore(db_path: Path | str, *, reason: str = "manua
     finally:
         conn.close()
 
+    if int(row_counts.get("sku_imports") or 0) <= 0 or int(row_counts.get("sku_items") or 0) <= 0:
+        return {
+            "ok": False,
+            "message": "Skipped backup: local StockX source list is empty",
+            "row_counts": row_counts,
+        }
+
     if _should_skip_destructive_zero_score_backup(db, settings, row_counts, reason):
         return {
             "ok": False,
@@ -461,8 +468,25 @@ def restore_sqlite_backup_if_needed(db_path: Path | str) -> bool:
     if not settings.firebase_enabled:
         return False
     path = Path(db_path)
-    if path.exists() and path.stat().st_size > 32768:
-        return False
+    local_counts: dict[str, int] = {}
+    if path.exists():
+        try:
+            conn = sqlite3.connect(path, timeout=60)
+            conn.row_factory = sqlite3.Row
+            try:
+                init_db(conn)
+                local_counts = _core_row_counts(conn)
+            finally:
+                conn.close()
+            if (
+                int(local_counts.get("sku_imports") or 0) > 0
+                and int(local_counts.get("sku_items") or 0) > 0
+                and int(local_counts.get("opportunity_scores") or 0) > 0
+            ):
+                return False
+        except Exception:
+            if path.stat().st_size > 32768:
+                return False
 
     db = firestore_client()
     if db is None:
@@ -476,6 +500,17 @@ def restore_sqlite_backup_if_needed(db_path: Path | str) -> bool:
     if chunk_count <= 0:
         return False
     sqlite_counts = meta_data.get("row_counts") or {}
+    if int(sqlite_counts.get("sku_imports") or 0) <= 0 or int(sqlite_counts.get("sku_items") or 0) <= 0:
+        write_cloud_event(
+            "sqlite_restore_skipped_empty_source",
+            {
+                "sqlite_row_counts": sqlite_counts,
+                "local_row_counts": local_counts,
+                "backup_updated_at": meta_data.get("updated_at"),
+                "created_at": utc_now(),
+            },
+        )
+        return False
     sqlite_scores = int(sqlite_counts.get("opportunity_scores") or 0)
     core_scores = _remote_core_opportunity_score_count(db, settings)
     if sqlite_scores == 0 and core_scores > 0:

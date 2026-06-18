@@ -3045,6 +3045,21 @@ def schedule_startup_core_backup_if_needed(settings) -> None:
     if not settings.firebase_enabled:
         return
     try:
+        db_path = Path(settings.db_path)
+        if db_path.exists():
+            conn = connect(db_path)
+            try:
+                init_db(conn)
+                imports = int(conn.execute("SELECT COUNT(*) FROM sku_imports").fetchone()[0] or 0)
+                items = int(conn.execute("SELECT COUNT(*) FROM sku_items").fetchone()[0] or 0)
+                scores = int(conn.execute("SELECT COUNT(*) FROM opportunity_scores").fetchone()[0] or 0)
+            finally:
+                conn.close()
+            if imports <= 0 or items <= 0 or scores <= 0:
+                return
+    except Exception:
+        return
+    try:
         marker = json_loads(CORE_BACKUP_BOOTSTRAP_MARKER.read_text(encoding="utf-8"), {}) or {}
     except OSError:
         marker = {}
