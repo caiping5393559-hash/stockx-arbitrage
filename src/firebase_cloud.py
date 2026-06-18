@@ -213,6 +213,10 @@ def _should_skip_regressive_score_backup(db, settings, row_counts: dict[str, int
     return False
 
 
+def _should_skip_regressive_sqlite_restore(sqlite_scores: int, core_scores: int) -> bool:
+    return int(sqlite_scores or 0) < int(core_scores or 0)
+
+
 def _replace_table_rows(conn: sqlite3.Connection, table: str, rows: list[dict[str, Any]]) -> None:
     if not rows or not _table_exists(conn, table):
         return
@@ -515,9 +519,9 @@ def restore_sqlite_backup_if_needed(db_path: Path | str) -> bool:
         return False
     sqlite_scores = int(sqlite_counts.get("opportunity_scores") or 0)
     core_scores = _remote_core_opportunity_score_count(db, settings)
-    if sqlite_scores == 0 and core_scores > 0:
+    if _should_skip_regressive_sqlite_restore(sqlite_scores, core_scores):
         write_cloud_event(
-            "sqlite_restore_skipped_zero_scores",
+            "sqlite_restore_skipped_regressive_scores",
             {
                 "sqlite_opportunity_scores": sqlite_scores,
                 "core_opportunity_scores": core_scores,

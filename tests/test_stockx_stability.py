@@ -5,7 +5,11 @@ import unittest
 import pandas as pd
 
 from src.db import init_db
-from src.firebase_cloud import CORE_BACKUP_TABLES, _should_skip_regressive_score_backup
+from src.firebase_cloud import (
+    CORE_BACKUP_TABLES,
+    _should_skip_regressive_score_backup,
+    _should_skip_regressive_sqlite_restore,
+)
 from src.importer import import_sku_file
 from src.progress import apply_stockx_progress_watermark
 
@@ -128,6 +132,11 @@ class StockxStabilityTests(unittest.TestCase):
 
     def test_progress_watermark_table_is_in_cloud_backup_scope(self) -> None:
         self.assertIn("stockx_import_progress_watermarks", CORE_BACKUP_TABLES)
+
+    def test_sqlite_restore_rejects_lower_score_snapshot(self) -> None:
+        self.assertTrue(_should_skip_regressive_sqlite_restore(1598, 2537))
+        self.assertFalse(_should_skip_regressive_sqlite_restore(2537, 2537))
+        self.assertFalse(_should_skip_regressive_sqlite_restore(2600, 2537))
 
 
 if __name__ == "__main__":
