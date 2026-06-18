@@ -6216,6 +6216,23 @@ def page_opportunity_board(conn, settings) -> None:
             if job_id:
                 st.session_state["sync_notice"] = "检测到当前批次评分为0，已自动启动本地评分恢复。"
                 st.rerun()
+    if (
+        active_import_id
+        and incomplete_styles
+        and scored_count > 0
+        and not job_running
+        and st.session_state.get("_opp_partial_resume_import_id") != active_import_id
+    ):
+        st.session_state["_opp_partial_resume_import_id"] = active_import_id
+        worker = start_stockx_full_sync_worker_process("partial_auto_resume")
+        if worker.get("started"):
+            st.session_state["sync_notice"] = (
+                f"检测到当前批次还有 {len(incomplete_styles)} 个未完成货号，"
+                "已自动启动独立后台worker继续补跑；已有评分不会清空。"
+            )
+            st.rerun()
+        else:
+            st.session_state["sync_notice"] = f"检测到未完成货号，但后台worker未启动：{worker.get('reason') or '-'}"
     _frontend_auto_refresh(job_running, interval_seconds=8, key="opportunity_progress")
 
     setup_tabs = st.tabs(["当前源文件 / 上传", "任务 / 数据维护", "历史结果"])
