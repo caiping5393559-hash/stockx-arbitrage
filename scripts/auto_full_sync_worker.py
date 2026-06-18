@@ -25,6 +25,8 @@ from src.sync import sync_style  # noqa: E402
 MARKER_PATH = BASE_DIR / "data" / "auto_hourly_full_sync.json"
 JOB_LOCK_PATH = BASE_DIR / "data" / "sync_job.lock"
 WORKER_LOCK_PATH = BASE_DIR / "data" / "auto_full_sync_worker.lock"
+SYNC_STATE_PATH = BASE_DIR / "data" / "sync_state.json"
+WORKER_RUN_DIR = BASE_DIR / "data" / "stockx_worker_runs"
 POLL_SECONDS = 60
 MIN_INTERVAL_SECONDS = 15 * 60
 LOCK_STALE_SECONDS = 6 * 60 * 60
@@ -55,6 +57,32 @@ def _read_marker() -> dict[str, Any]:
 def _write_marker(data: dict[str, Any]) -> None:
     MARKER_PATH.parent.mkdir(parents=True, exist_ok=True)
     MARKER_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+
+
+def _write_sync_state(data: dict[str, Any]) -> None:
+    SYNC_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = SYNC_STATE_PATH.with_name(f"{SYNC_STATE_PATH.name}.{os.getpid()}.tmp")
+    tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    os.replace(tmp_path, SYNC_STATE_PATH)
+
+
+def _update_sync_state(job_id: str, **changes: Any) -> None:
+    try:
+        try:
+            state = json_loads(SYNC_STATE_PATH.read_text(encoding="utf-8"), {}) or {}
+        except OSError:
+            state = {}
+        state.update(
+            {
+                "job_id": job_id,
+                "status": "running",
+                "updated_at": _now().isoformat(timespec="seconds"),
+            }
+        )
+        state.update(changes)
+        _write_sync_state(state)
+    except Exception:
+        pass
 
 
 def _count_opportunity_scores(conn: sqlite3.Connection) -> int:
@@ -195,33 +223,40 @@ def _run_style_child() -> int:
     db_path = Path(os.environ["STOCKX_STYLE_DB_PATH"])
     style_no = str(os.environ["STOCKX_STYLE_NO"]).strip().upper()
     result = _sync_one_style(db_path, style_no)
-    print(json.dumps(result, ensure_ascii=False, default=str), flush=True)
+    result_path = os.environ.get("STOCKX_STYLE_RESULT_PATH")
+    if result_path:
+        Path(result_path).write_text(json.dumps(result, ensure_ascii=False, default=str), encoding="utf-8")
+    else:
+        print(json.dumps(result, ensure_ascii=False, default=str), flush=True)
     return 0
 
 
-def _parse_child_result(stdout: str, style_no: str) -> dict[str, Any]:
-    for line in reversed((stdout or "").splitlines()):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            data = json.loads(line)
-            if isinstance(data, dict):
-                return data
-        except json.JSONDecodeError:
-            continue
+def _parse_child_result(result_path: Path, style_no: str) -> dict[str, Any]:
+    try:
+        data = json_loads(result_path.read_text(encoding="utf-8"), {})
+        if isinstance(data, dict):
+            return data
+    except OSError:
+        pass
     return {"style_no": style_no, "errors": ["子进程没有返回可解析结果"]}
 
 
-def _kill_process(proc: subprocess.Popen[str]) -> tuple[str, str]:
+def _read_tail(path: Path, limit: int = 2000) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")[-limit:]
+    except OSError:
+        return ""
+
+
+def _kill_process(proc: subprocess.Popen[Any]) -> None:
     try:
         proc.kill()
     except Exception:
         pass
     try:
-        return proc.communicate(timeout=10)
+        proc.wait(timeout=10)
     except Exception:
-        return "", ""
+        pass
 
 
 def _run_full_sync() -> None:
@@ -264,6 +299,19 @@ def _run_full_sync() -> None:
             }
         )
         _write_marker(marker)
+        _update_sync_state(
+            job_id,
+            status="running",
+            message=f"今日机会全量刷新StockX API开始：{len(styles)} 个货号",
+            progress=0.0,
+            completed=0,
+            total=len(styles),
+            current_style=None,
+            current_size=None,
+            current_phase="StockX API",
+            current_endpoint="启动",
+            recomputed=0,
+        )
 
         if not styles:
             log_sync(conn, "自动全量同步跳过：没有导入货号", event_type="auto_full_sync")
@@ -373,24 +421,41 @@ def _run_full_sync() -> None:
                 return
             style_no = styles[next_index]
             next_index += 1
+            WORKER_RUN_DIR.mkdir(parents=True, exist_ok=True)
+            run_key = f"{job_id}_{next_index:05d}_{style_no.replace('/', '_').replace(' ', '_')}"
+            result_path = WORKER_RUN_DIR / f"{run_key}.json"
+            log_path = WORKER_RUN_DIR / f"{run_key}.log"
+            log_handle = log_path.open("w", encoding="utf-8", errors="replace")
             env = os.environ.copy()
             env["STOCKX_STYLE_WORKER"] = "1"
             env["STOCKX_STYLE_DB_PATH"] = str(settings.db_path)
             env["STOCKX_STYLE_NO"] = style_no
+            env["STOCKX_STYLE_RESULT_PATH"] = str(result_path)
             proc = subprocess.Popen(
                 [sys.executable, str(Path(__file__).resolve())],
                 cwd=str(BASE_DIR),
                 env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
             )
             process_map[proc] = {
                 "style_no": style_no,
                 "started_at": time.monotonic(),
+                "result_path": result_path,
+                "log_path": log_path,
+                "log_handle": log_handle,
             }
+            _update_sync_state(
+                job_id,
+                completed=completed,
+                total=len(styles),
+                current_style=style_no,
+                current_phase="StockX API",
+                current_endpoint="已派发",
+                progress=completed / len(styles) if styles else 1.0,
+                message=f"已派发 {next_index}/{len(styles)}，并发 {worker_count}",
+                recomputed=recomputed,
+            )
 
         def finish_style(proc: subprocess.Popen[str], timed_out: bool = False) -> None:
             nonlocal completed, errors
@@ -399,9 +464,16 @@ def _run_full_sync() -> None:
                 return
             completed += 1
             style_no = str(meta["style_no"])
+            result_path = Path(meta["result_path"])
+            log_path = Path(meta["log_path"])
+            try:
+                meta["log_handle"].close()
+            except Exception:
+                pass
             pending_recompute.append(style_no)
             if timed_out:
-                stdout, stderr = _kill_process(proc)
+                _kill_process(proc)
+                log_tail = _read_tail(log_path)
                 errors += 1
                 log_sync(
                     conn,
@@ -412,17 +484,17 @@ def _run_full_sync() -> None:
                     details={
                         "job_id": job_id,
                         "timeout_seconds": STYLE_SYNC_HARD_TIMEOUT_SECONDS,
-                        "stderr_tail": (stderr or "")[-2000:],
-                        "stdout_tail": (stdout or "")[-2000:],
+                        "log_tail": log_tail,
                     },
                 )
             else:
                 try:
-                    stdout, stderr = proc.communicate(timeout=10)
+                    proc.wait(timeout=10)
                 except subprocess.TimeoutExpired:
-                    stdout, stderr = _kill_process(proc)
+                    _kill_process(proc)
                     timed_out = True
                 if timed_out:
+                    log_tail = _read_tail(log_path)
                     errors += 1
                     log_sync(
                         conn,
@@ -430,15 +502,16 @@ def _run_full_sync() -> None:
                         severity="error",
                         event_type="auto_full_sync_style_timeout",
                         style_no=style_no,
-                        details={"job_id": job_id, "stderr_tail": (stderr or "")[-2000:]},
+                        details={"job_id": job_id, "log_tail": log_tail},
                     )
                 else:
-                    result = _parse_child_result(stdout or "", style_no)
+                    result = _parse_child_result(result_path, style_no)
                     style_errors = list(result.get("errors") or [])
                     if proc.returncode not in (0, None):
                         style_errors.append(f"子进程退出码 {proc.returncode}")
-                    if stderr:
-                        style_errors.append((stderr or "")[-2000:])
+                    log_tail = _read_tail(log_path)
+                    if log_tail:
+                        style_errors.append(log_tail)
                     errors += len(style_errors)
                     if style_errors:
                         log_sync(
@@ -466,6 +539,17 @@ def _run_full_sync() -> None:
                 )
                 _write_marker(marker)
                 conn.commit()
+            _update_sync_state(
+                job_id,
+                completed=completed,
+                total=len(styles),
+                current_style=style_no,
+                current_phase="StockX API",
+                current_endpoint="timeout_skip" if timed_out else "style_done",
+                progress=completed / len(styles) if styles else 1.0,
+                message=f"已处理 {completed}/{len(styles)}，已增量重算 {recomputed} 个尺码",
+                recomputed=recomputed,
+            )
             try_recompute_pending(style_no)
 
         try:
@@ -494,8 +578,12 @@ def _run_full_sync() -> None:
                         finish_style(proc, timed_out=True)
                         submit_next()
         finally:
-            for proc in list(process_map):
+            for proc, meta in list(process_map.items()):
                 _kill_process(proc)
+                try:
+                    meta["log_handle"].close()
+                except Exception:
+                    pass
             process_map.clear()
 
         if pending_recompute:
@@ -516,6 +604,19 @@ def _run_full_sync() -> None:
             }
         )
         _write_marker(marker)
+        _update_sync_state(
+            job_id,
+            status="done",
+            progress=1.0,
+            completed=len(styles),
+            total=len(styles),
+            current_style=None,
+            current_phase="完成",
+            current_endpoint=None,
+            message=marker["last_message"],
+            recomputed=recomputed,
+            finished_at=finished.isoformat(timespec="seconds"),
+        )
         log_sync(
             conn,
             marker["last_message"],
@@ -536,6 +637,15 @@ def _run_full_sync() -> None:
             }
         )
         _write_marker(marker)
+        _update_sync_state(
+            job_id,
+            status="error",
+            message=marker["last_message"],
+            error=str(exc),
+            current_phase="失败",
+            current_endpoint=None,
+            finished_at=_now().isoformat(timespec="seconds"),
+        )
         try:
             log_sync(
                 conn,

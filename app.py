@@ -3473,6 +3473,10 @@ def start_stockx_full_sync_worker_process(source: str = "manual_resume") -> dict
     _write_auto_hourly_marker(marker)
     try:
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        log_dir = BASE_DIR / "data" / "worker_logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / f"stockx_full_sync_{now.strftime('%Y%m%d%H%M%S')}_{job_id if 'job_id' in locals() else source}.log"
+        log_handle = log_path.open("a", encoding="utf-8", errors="replace")
         subprocess.Popen(
             [
                 str(python_exe),
@@ -3481,8 +3485,11 @@ def start_stockx_full_sync_worker_process(source: str = "manual_resume") -> dict
             ],
             cwd=str(BASE_DIR),
             stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
             creationflags=creationflags,
         )
+        log_handle.close()
         return {"started": True, "started_at": now.isoformat(timespec="seconds")}
     except Exception as exc:  # noqa: BLE001
         marker.update(
