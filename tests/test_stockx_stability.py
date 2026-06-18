@@ -5,8 +5,42 @@ import unittest
 import pandas as pd
 
 from src.db import init_db
+from src.firebase_cloud import CORE_BACKUP_TABLES, _should_skip_regressive_score_backup
 from src.importer import import_sku_file
 from src.progress import apply_stockx_progress_watermark
+
+
+class _FakeDoc:
+    exists = True
+
+    def __init__(self, data: dict) -> None:
+        self._data = data
+
+    def get(self) -> "_FakeDoc":
+        return self
+
+    def to_dict(self) -> dict:
+        return self._data
+
+
+class _FakeCollection:
+    def __init__(self, docs: dict[str, _FakeDoc]) -> None:
+        self.docs = docs
+
+    def document(self, name: str) -> _FakeDoc:
+        return self.docs.get(name, _FakeDoc({}))
+
+
+class _FakeFirestore:
+    def __init__(self, docs: dict[str, _FakeDoc]) -> None:
+        self.docs = docs
+
+    def collection(self, _name: str) -> _FakeCollection:
+        return _FakeCollection(self.docs)
+
+
+class _FakeSettings:
+    firebase_collection_prefix = "test"
 
 
 class StockxStabilityTests(unittest.TestCase):
@@ -67,6 +101,33 @@ class StockxStabilityTests(unittest.TestCase):
             self.assertEqual(styles, ["924453-100", "HQ6998-200"])
         finally:
             conn.close()
+
+    def test_cloud_backup_rejects_lower_score_snapshot(self) -> None:
+        fake_db = _FakeFirestore(
+            {
+                "core_backup": _FakeDoc({"row_counts": {"opportunity_scores": 2156}}),
+                "sqlite_backup": _FakeDoc({"row_counts": {"opportunity_scores": 2156}}),
+            }
+        )
+        self.assertTrue(
+            _should_skip_regressive_score_backup(
+                fake_db,
+                _FakeSettings(),
+                {"opportunity_scores": 1598},
+                "unit",
+            )
+        )
+        self.assertFalse(
+            _should_skip_regressive_score_backup(
+                fake_db,
+                _FakeSettings(),
+                {"opportunity_scores": 2156},
+                "unit",
+            )
+        )
+
+    def test_progress_watermark_table_is_in_cloud_backup_scope(self) -> None:
+        self.assertIn("stockx_import_progress_watermarks", CORE_BACKUP_TABLES)
 
 
 if __name__ == "__main__":

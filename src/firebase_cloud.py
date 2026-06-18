@@ -113,6 +113,7 @@ CORE_BACKUP_TABLES = (
     "sku_items",
     "products",
     "stockx_style_sync_status",
+    "stockx_import_progress_watermarks",
     "opportunity_scores",
     "opportunity_import_snapshots",
     "opportunity_score_history",
@@ -130,6 +131,7 @@ STOCKX_CORE_BACKUP_TABLES = (
     "sku_items",
     "products",
     "stockx_style_sync_status",
+    "stockx_import_progress_watermarks",
     "opportunity_scores",
     "opportunity_import_snapshots",
     "opportunity_score_history",
@@ -194,12 +196,12 @@ def _remote_core_opportunity_score_count(db, settings) -> int:
         return 0
 
 
-def _should_skip_destructive_zero_score_backup(db, settings, row_counts: dict[str, int], reason: str) -> bool:
+def _should_skip_regressive_score_backup(db, settings, row_counts: dict[str, int], reason: str) -> bool:
     local_scores = int(row_counts.get("opportunity_scores") or 0)
     remote_scores = _remote_opportunity_score_count(db, settings)
-    if local_scores == 0 and remote_scores > 0:
+    if local_scores < remote_scores:
         write_cloud_event(
-            "backup_skipped_zero_scores",
+            "backup_skipped_regressive_scores",
             {
                 "reason": reason,
                 "local_opportunity_scores": local_scores,
@@ -330,10 +332,10 @@ def backup_core_tables_to_firestore(db_path: Path | str, *, reason: str = "manua
             "row_counts": row_counts,
         }
 
-    if _should_skip_destructive_zero_score_backup(db, settings, row_counts, reason):
+    if _should_skip_regressive_score_backup(db, settings, row_counts, reason):
         return {
             "ok": False,
-            "message": "Skipped backup: local opportunity_scores is 0 while remote backup has scores",
+            "message": "Skipped backup: local opportunity_scores is lower than remote backup",
             "row_counts": row_counts,
         }
 
@@ -573,10 +575,10 @@ def backup_sqlite_to_firestore(db_path: Path | str, *, reason: str = "manual") -
     finally:
         count_conn.close()
 
-    if _should_skip_destructive_zero_score_backup(db, settings, local_counts, reason):
+    if _should_skip_regressive_score_backup(db, settings, local_counts, reason):
         return {
             "ok": False,
-            "message": "Skipped SQLite backup: local opportunity_scores is 0 while remote backup has scores",
+            "message": "Skipped SQLite backup: local opportunity_scores is lower than remote backup",
             "row_counts": local_counts,
         }
 
