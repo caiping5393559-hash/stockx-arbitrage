@@ -3508,7 +3508,7 @@ def _auto_hourly_full_sync_loop() -> None:
             if settings.auto_full_sync_enabled and settings.credentials_ready:
                 state = _sync_state_snapshot()
                 imported_styles = _load_all_imported_styles_for_auto_sync(settings.db_path)
-                if imported_styles and state.get("status") != "running":
+                if imported_styles:
                     conn = connect(settings.db_path)
                     init_db(conn)
                     try:
@@ -3532,10 +3532,32 @@ def _auto_hourly_full_sync_loop() -> None:
                         not last_partial_ts
                         or datetime.utcnow().timestamp() - last_partial_ts >= 10 * 60
                     )
-                    if (
+                    state_blocks_resume = state.get("status") == "running"
+                    resume_is_due = (
                         score_count > 0
                         and incomplete_count > 0
                         and (partial_resume_key != last_partial_key or partial_retry_due)
+                    )
+                    if state_blocks_resume and resume_is_due and partial_retry_due:
+                        stale_state = dict(state)
+                        stale_state.update(
+                            {
+                                "status": "error",
+                                "error": "后台任务超过10分钟无评分进展，已释放旧运行状态并准备重启。",
+                                "message": "后台任务超过10分钟无评分进展，已释放旧运行状态并准备重启。",
+                                "finished_at": datetime.utcnow().isoformat(timespec="seconds"),
+                                "updated_at": datetime.utcnow().isoformat(timespec="seconds"),
+                            }
+                        )
+                        _write_sync_state_file(stale_state)
+                        try:
+                            JOB_LOCK_PATH.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        state_blocks_resume = False
+                    if (
+                        resume_is_due
+                        and not state_blocks_resume
                     ):
                         if partial_resume_key == last_partial_key and partial_retry_due and JOB_LOCK_PATH.exists():
                             try:
