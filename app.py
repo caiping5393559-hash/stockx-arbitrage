@@ -3462,11 +3462,54 @@ def _auto_hourly_full_sync_loop() -> None:
             marker = _mark_completed_auto_hourly_job_if_needed(_read_auto_hourly_marker())
             if settings.auto_full_sync_enabled and settings.credentials_ready:
                 state = _sync_state_snapshot()
+                imported_styles = _load_all_imported_styles_for_auto_sync(settings.db_path)
+                if imported_styles and state.get("status") != "running":
+                    conn = connect(settings.db_path)
+                    init_db(conn)
+                    try:
+                        active_import_id, _, _, imported_scope_sql = latest_stockx_import_scope(conn)
+                        score_count = (
+                            conn.execute(
+                                f"SELECT COUNT(*) FROM opportunity_scores WHERE style_no IN ({imported_scope_sql})"
+                            ).fetchone()[0]
+                            or 0
+                        )
+                        active_import_style_set = set(imported_styles)
+                        incomplete_count = len(
+                            [style for style in load_incomplete_stockx_skus(conn) if style in active_import_style_set]
+                        )
+                    finally:
+                        conn.close()
+                    partial_resume_key = f"{active_import_id}:{score_count}:{incomplete_count}"
+                    last_partial_key = str(marker.get("last_partial_resume_key") or "")
+                    if score_count > 0 and incomplete_count > 0 and partial_resume_key != last_partial_key:
+                        worker = start_stockx_full_sync_worker_process("scheduler_partial_auto_resume")
+                        now = datetime.utcnow()
+                        updated = _read_auto_hourly_marker()
+                        updated.update(
+                            {
+                                "enabled": True,
+                                "interval_minutes": int(settings.auto_full_sync_interval_minutes or 60),
+                                "last_checked_at": now.isoformat(timespec="seconds"),
+                                "last_checked_ts": now.timestamp(),
+                                "last_style_count": len(imported_styles),
+                                "last_partial_resume_key": partial_resume_key,
+                            }
+                        )
+                        if worker.get("started"):
+                            updated["last_message"] = (
+                                f"检测到当前批次还有 {incomplete_count} 个未完成货号，"
+                                f"已自动启动后台worker继续补跑：{len(imported_styles)} 个货号"
+                            )
+                        else:
+                            updated["last_message"] = f"检测到未完成货号，但worker未启动：{worker.get('reason') or '-'}"
+                        _write_auto_hourly_marker(updated)
+                        time_module.sleep(AUTO_HOURLY_SYNC_POLL_SECONDS)
+                        continue
                 if (
                     state.get("status") != "running"
                     and _auto_hourly_full_sync_due(marker, interval_seconds)
                 ):
-                    imported_styles = _load_all_imported_styles_for_auto_sync(settings.db_path)
                     if imported_styles:
                         worker = start_stockx_full_sync_worker_process("auto_hourly")
                         now = datetime.utcnow()
