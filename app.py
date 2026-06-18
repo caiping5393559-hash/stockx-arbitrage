@@ -3435,8 +3435,6 @@ def start_stockx_full_sync_worker_process(source: str = "manual_resume") -> dict
             ],
             cwd=str(BASE_DIR),
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
             creationflags=creationflags,
         )
         return {"started": True, "started_at": now.isoformat(timespec="seconds")}
@@ -3472,7 +3470,7 @@ def _auto_hourly_full_sync_loop() -> None:
                     if imported_styles:
                         worker = start_stockx_full_sync_worker_process("auto_hourly")
                         now = datetime.utcnow()
-                        updated = dict(marker)
+                        updated = _read_auto_hourly_marker()
                         updated.update(
                             {
                                 "enabled": True,
