@@ -284,6 +284,8 @@ def _run_full_sync() -> None:
                     "workers": worker_count,
                     "recomputed": recomputed,
                     "opportunity_scores": score_count,
+                    "last_progress_at": _now().isoformat(timespec="seconds"),
+                    "last_progress_ts": _now().timestamp(),
                     "last_checked_at": _now().isoformat(timespec="seconds"),
                     "last_message": f"今日机会已同步并增量重算：{completed}/{len(styles)} 个货号，新增 {batch_recomputed} 个尺码，累计 {recomputed} 个尺码",
                 }
@@ -397,6 +399,8 @@ def _run_full_sync() -> None:
                                 "current_style": style_no,
                                 "workers": worker_count,
                                 "recomputed": recomputed,
+                                "last_progress_at": _now().isoformat(timespec="seconds"),
+                                "last_progress_ts": _now().timestamp(),
                                 "last_checked_at": _now().isoformat(timespec="seconds"),
                                 "last_message": f"今日机会全量刷新StockX API中：{completed}/{len(styles)} {style_no}（并发 {worker_count}，已增量重算 {recomputed} 个尺码）",
                             }
@@ -437,6 +441,8 @@ def _run_full_sync() -> None:
                                 "current_style": style_no,
                                 "workers": worker_count,
                                 "recomputed": recomputed,
+                                "last_progress_at": _now().isoformat(timespec="seconds"),
+                                "last_progress_ts": _now().timestamp(),
                                 "last_checked_at": _now().isoformat(timespec="seconds"),
                                 "last_message": f"今日机会全量刷新StockX API中：{completed}/{len(styles)} {style_no}（并发 {worker_count}，已增量重算 {recomputed} 个尺码）",
                             }

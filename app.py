@@ -2896,7 +2896,12 @@ def _auto_hourly_status_snapshot(settings) -> dict[str, Any]:
     valid_finished_ts = finished_ts if finished_ts and (not started_ts or finished_ts >= started_ts) else None
     now_ts = datetime.utcnow().timestamp()
     last_touch_ts = (
-        _timestamp_from_marker(marker.get("last_checked_ts"))
+        _timestamp_from_marker(marker.get("last_progress_ts"))
+        or _timestamp_from_marker(marker.get("last_progress_at"))
+        or _timestamp_from_marker(marker.get("last_checkpoint_at"))
+        or _timestamp_from_marker(marker.get("last_partial_resume_ts"))
+        or _timestamp_from_marker(marker.get("last_partial_resume_at"))
+        or _timestamp_from_marker(marker.get("last_checked_ts"))
         or _timestamp_from_marker(marker.get("last_checked_at"))
         or started_ts
     )
@@ -3422,7 +3427,12 @@ def start_stockx_full_sync_worker_process(source: str = "manual_resume") -> dict
     if str(marker.get("last_status") or "") == "running" and JOB_LOCK_PATH.exists():
         now_ts = datetime.utcnow().timestamp()
         last_touch_ts = (
-            _timestamp_from_marker(marker.get("last_checked_ts"))
+            _timestamp_from_marker(marker.get("last_progress_ts"))
+            or _timestamp_from_marker(marker.get("last_progress_at"))
+            or _timestamp_from_marker(marker.get("last_checkpoint_at"))
+            or _timestamp_from_marker(marker.get("last_partial_resume_ts"))
+            or _timestamp_from_marker(marker.get("last_partial_resume_at"))
+            or _timestamp_from_marker(marker.get("last_checked_ts"))
             or _timestamp_from_marker(marker.get("last_checked_at"))
             or _timestamp_from_marker(marker.get("last_started_ts"))
             or _timestamp_from_marker(marker.get("last_started_at"))
@@ -3527,6 +3537,11 @@ def _auto_hourly_full_sync_loop() -> None:
                         and incomplete_count > 0
                         and (partial_resume_key != last_partial_key or partial_retry_due)
                     ):
+                        if partial_resume_key == last_partial_key and partial_retry_due and JOB_LOCK_PATH.exists():
+                            try:
+                                JOB_LOCK_PATH.unlink(missing_ok=True)
+                            except Exception:
+                                pass
                         worker = start_stockx_full_sync_worker_process("scheduler_partial_auto_resume")
                         now = datetime.utcnow()
                         updated = _read_auto_hourly_marker()
