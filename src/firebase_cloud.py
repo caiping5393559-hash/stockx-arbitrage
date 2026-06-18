@@ -123,6 +123,16 @@ CORE_BACKUP_TABLES = (
     "goat_hidden_styles",
 )
 
+STOCKX_CORE_BACKUP_TABLES = (
+    "sku_imports",
+    "sku_import_sheets",
+    "sku_items",
+    "products",
+    "opportunity_scores",
+    "opportunity_import_snapshots",
+    "opportunity_score_history",
+)
+
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     row = conn.execute(
@@ -313,11 +323,11 @@ def restore_core_tables_if_needed(db_path: Path | str) -> bool:
     conn.row_factory = sqlite3.Row
     try:
         init_db(conn)
-        existing_imports = conn.execute("SELECT COUNT(*) FROM sku_imports").fetchone()[0] or 0
-        existing_scores = conn.execute("SELECT COUNT(*) FROM opportunity_scores").fetchone()[0] or 0
+        local_counts = _core_row_counts(conn)
+        existing_imports = int(local_counts.get("sku_imports") or 0)
+        existing_items = int(local_counts.get("sku_items") or 0)
+        existing_scores = int(local_counts.get("opportunity_scores") or 0)
         existing_goat = conn.execute("SELECT COUNT(*) FROM goat_consignment_scores").fetchone()[0] or 0
-        if existing_imports or existing_scores or existing_goat:
-            return False
     finally:
         conn.close()
 
@@ -328,13 +338,20 @@ def restore_core_tables_if_needed(db_path: Path | str) -> bool:
     if not payload:
         return False
     tables = payload.get("tables") or {}
+    remote_counts = payload.get("row_counts") or {}
+    remote_imports = int(remote_counts.get("sku_imports") or 0)
+    remote_items = int(remote_counts.get("sku_items") or 0)
+    remote_scores = int(remote_counts.get("opportunity_scores") or 0)
+    if existing_imports >= remote_imports and existing_items >= remote_items and existing_scores >= remote_scores:
+        return False
+    tables_to_restore = CORE_BACKUP_TABLES if not existing_goat else STOCKX_CORE_BACKUP_TABLES
 
     conn = sqlite3.connect(path, timeout=60)
     conn.row_factory = sqlite3.Row
     try:
         init_db(conn)
         conn.execute("BEGIN")
-        for table in CORE_BACKUP_TABLES:
+        for table in tables_to_restore:
             rows = tables.get(table) or []
             if isinstance(rows, list):
                 _replace_table_rows(conn, table, rows)
