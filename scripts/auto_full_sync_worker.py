@@ -183,16 +183,29 @@ def _release_worker_lock() -> None:
         pass
 
 
-def _load_imported_styles(conn) -> list[str]:
-    rows = query_rows(
-        conn,
-        """
-        SELECT DISTINCT style_no
-        FROM sku_items
-        WHERE style_no IS NOT NULL AND TRIM(style_no) != ''
-        ORDER BY style_no
-        """,
-    )
+def _load_imported_styles(conn, import_id: int | None = None) -> list[str]:
+    if import_id is None:
+        rows = query_rows(
+            conn,
+            """
+            SELECT DISTINCT style_no
+            FROM sku_items
+            WHERE style_no IS NOT NULL AND TRIM(style_no) != ''
+            ORDER BY style_no
+            """,
+        )
+    else:
+        rows = query_rows(
+            conn,
+            """
+            SELECT DISTINCT style_no
+            FROM sku_items
+            WHERE import_id = ?
+              AND style_no IS NOT NULL AND TRIM(style_no) != ''
+            ORDER BY style_no
+            """,
+            (import_id,),
+        )
     return [str(row["style_no"]).strip().upper() for row in rows if row["style_no"]]
 
 
@@ -337,8 +350,9 @@ def _run_full_sync() -> None:
     init_db(conn)
     try:
         import_id = _latest_stockx_import_id(conn)
-        styles = _load_imported_styles(conn)
+        styles = _load_imported_styles(conn, import_id)
         started = _now()
+        existing_scores = _count_opportunity_scores(conn)
         marker.update(
             {
                 "enabled": True,
@@ -347,9 +361,10 @@ def _run_full_sync() -> None:
                 "last_started_ts": started.timestamp(),
                 "last_status": "running",
                 "last_style_count": len(styles),
-                "completed": 0,
+                "completed": int(marker.get("completed") or 0),
                 "total": len(styles),
-                "recomputed": 0,
+                "recomputed": int(marker.get("recomputed") or 0),
+                "opportunity_scores": existing_scores,
                 "last_finished_at": None,
                 "last_finished_ts": None,
                 "last_error": None,
@@ -364,13 +379,13 @@ def _run_full_sync() -> None:
             status="running",
             message=f"今日机会全量刷新StockX API开始：{len(styles)} 个货号",
             progress=0.0,
-            completed=0,
+            completed=int(marker.get("completed") or 0),
             total=len(styles),
             current_style=None,
             current_size=None,
             current_phase="StockX API",
             current_endpoint="启动",
-            recomputed=0,
+            recomputed=int(marker.get("recomputed") or 0),
         )
 
         if not styles:
@@ -400,21 +415,27 @@ def _run_full_sync() -> None:
             if not pending_recompute:
                 return
             batch_styles = pending_recompute[:]
+            score_conn = connect(settings.db_path)
+            init_db(score_conn)
             try:
                 batch_recomputed = compute_and_store_opportunities(
-                    conn,
+                    score_conn,
                     fee_rate=settings.estimated_seller_fee_rate,
                     sales_fraction=settings.buy_depth_sales_fraction,
                     style_nos=batch_styles,
                 )
             except sqlite3.OperationalError as exc:
                 if "locked" in str(exc).lower():
-                    conn.rollback()
+                    score_conn.rollback()
                     return
                 raise
+            finally:
+                try:
+                    score_conn.close()
+                except Exception:
+                    pass
             pending_recompute = []
             recomputed += batch_recomputed
-            conn.commit()
             score_count = _count_opportunity_scores(conn)
             marker.update(
                 {
