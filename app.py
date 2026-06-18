@@ -3426,6 +3426,8 @@ def _load_all_imported_styles_for_auto_sync(db_path: Path) -> list[str]:
 
 def _run_stockx_full_sync_thread(source: str) -> None:
     try:
+        if os.environ.get("RENDER") or os.environ.get("RENDER_SERVICE_ID"):
+            os.environ["STOCKX_INLINE_STYLE_WORKER"] = "1"
         from scripts.auto_full_sync_worker import _run_full_sync
 
         _run_full_sync()

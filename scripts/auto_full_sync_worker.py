@@ -8,6 +8,7 @@ import sys
 import time
 import traceback
 import uuid
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -471,68 +472,18 @@ def _run_full_sync() -> None:
                     )
                     _write_marker(marker)
 
-        next_index = 0
-        process_map: dict[subprocess.Popen[str], dict[str, Any]] = {}
-
-        def submit_next() -> None:
-            nonlocal next_index
-            if next_index >= len(styles):
-                return
-            style_no = styles[next_index]
-            next_index += 1
-            WORKER_RUN_DIR.mkdir(parents=True, exist_ok=True)
-            run_key = f"{job_id}_{next_index:05d}_{style_no.replace('/', '_').replace(' ', '_')}"
-            result_path = WORKER_RUN_DIR / f"{run_key}.json"
-            log_path = WORKER_RUN_DIR / f"{run_key}.log"
-            log_handle = log_path.open("w", encoding="utf-8", errors="replace")
-            env = os.environ.copy()
-            env["STOCKX_STYLE_WORKER"] = "1"
-            env["STOCKX_STYLE_DB_PATH"] = str(settings.db_path)
-            env["STOCKX_STYLE_NO"] = style_no
-            env["STOCKX_STYLE_RESULT_PATH"] = str(result_path)
-            proc = subprocess.Popen(
-                [sys.executable, str(Path(__file__).resolve())],
-                cwd=str(BASE_DIR),
-                env=env,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-            )
-            process_map[proc] = {
-                "style_no": style_no,
-                "started_at": time.monotonic(),
-                "result_path": result_path,
-                "log_path": log_path,
-                "log_handle": log_handle,
-            }
-            _update_sync_state(
-                job_id,
-                completed=completed,
-                total=len(styles),
-                current_style=style_no,
-                current_phase="StockX API",
-                current_endpoint="已派发",
-                progress=completed / len(styles) if styles else 1.0,
-                message=f"已派发 {next_index}/{len(styles)}，并发 {worker_count}",
-                recomputed=recomputed,
-            )
-
-        def finish_style(proc: subprocess.Popen[str], timed_out: bool = False) -> None:
+        def finish_style_result(
+            style_no: str,
+            result: dict[str, Any] | None = None,
+            *,
+            timed_out: bool = False,
+            error_message: str | None = None,
+            log_tail: str = "",
+        ) -> None:
             nonlocal completed, errors
-            meta = process_map.pop(proc, None)
-            if not meta:
-                return
             completed += 1
-            style_no = str(meta["style_no"])
-            result_path = Path(meta["result_path"])
-            log_path = Path(meta["log_path"])
-            try:
-                meta["log_handle"].close()
-            except Exception:
-                pass
             pending_recompute.append(style_no)
             if timed_out:
-                _kill_process(proc)
-                log_tail = _read_tail(log_path)
                 errors += 1
                 _record_style_sync_status(
                     conn,
@@ -554,55 +505,30 @@ def _run_full_sync() -> None:
                     },
                 )
             else:
-                try:
-                    proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    _kill_process(proc)
-                    timed_out = True
-                if timed_out:
-                    log_tail = _read_tail(log_path)
-                    errors += 1
-                    _record_style_sync_status(
-                        conn,
-                        import_id=import_id,
-                        style_no=style_no,
-                        status="timeout",
-                        message="单货号结束读取超时，已跳过",
-                    )
+                result = result or {"style_no": style_no, "errors": []}
+                style_errors = list(result.get("errors") or [])
+                if error_message:
+                    style_errors.append(error_message)
+                if log_tail:
+                    style_errors.append(log_tail)
+                errors += len(style_errors)
+                _record_style_sync_status(
+                    conn,
+                    import_id=import_id,
+                    style_no=style_no,
+                    status="error" if style_errors else "done",
+                    result=result,
+                    message=style_errors[0] if style_errors else "done",
+                )
+                if style_errors:
                     log_sync(
                         conn,
-                        f"自动全量同步 {style_no} 结束读取超时，已杀掉该货号进程并继续下一个",
+                        f"自动全量同步 {style_no} 失败：{style_errors[0]}",
                         severity="error",
-                        event_type="auto_full_sync_style_timeout",
+                        event_type="auto_full_sync_style_error",
                         style_no=style_no,
-                        details={"job_id": job_id, "log_tail": log_tail},
+                        details={"job_id": job_id, "errors": style_errors[:5]},
                     )
-                else:
-                    result = _parse_child_result(result_path, style_no)
-                    style_errors = list(result.get("errors") or [])
-                    if proc.returncode not in (0, None):
-                        style_errors.append(f"子进程退出码 {proc.returncode}")
-                    log_tail = _read_tail(log_path)
-                    if log_tail:
-                        style_errors.append(log_tail)
-                    errors += len(style_errors)
-                    _record_style_sync_status(
-                        conn,
-                        import_id=import_id,
-                        style_no=style_no,
-                        status="error" if style_errors else "done",
-                        result=result,
-                        message=style_errors[0] if style_errors else "done",
-                    )
-                    if style_errors:
-                        log_sync(
-                            conn,
-                            f"自动全量同步 {style_no} 失败：{style_errors[0]}",
-                            severity="error",
-                            event_type="auto_full_sync_style_error",
-                            style_no=style_no,
-                            details={"job_id": job_id, "errors": style_errors[:5]},
-                        )
             if completed == 1 or completed % 5 == 0 or completed == len(styles):
                 marker.update(
                     {
@@ -633,39 +559,166 @@ def _run_full_sync() -> None:
             )
             try_recompute_pending(style_no)
 
-        try:
-            for _ in range(worker_count):
-                submit_next()
+        inline_mode = os.environ.get("STOCKX_INLINE_STYLE_WORKER") == "1"
+        if inline_mode:
+            worker_count = max(1, min(worker_count, 3))
+            next_index = 0
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                future_map: dict[Any, tuple[str, float]] = {}
 
-            while process_map:
-                now_monotonic = time.monotonic()
-                finished: list[subprocess.Popen[str]] = []
-                timed_out: list[subprocess.Popen[str]] = []
-                for proc, meta in list(process_map.items()):
-                    if proc.poll() is not None:
-                        finished.append(proc)
-                    elif now_monotonic - float(meta["started_at"]) >= STYLE_SYNC_HARD_TIMEOUT_SECONDS:
-                        timed_out.append(proc)
+                def submit_inline() -> None:
+                    nonlocal next_index
+                    if next_index >= len(styles):
+                        return
+                    style_no = styles[next_index]
+                    next_index += 1
+                    future = executor.submit(_sync_one_style, settings.db_path, style_no)
+                    future_map[future] = (style_no, time.monotonic())
+                    _update_sync_state(
+                        job_id,
+                        completed=completed,
+                        total=len(styles),
+                        current_style=style_no,
+                        current_phase="StockX API",
+                        current_endpoint="inline_dispatch",
+                        progress=completed / len(styles) if styles else 1.0,
+                        message=f"已派发 {next_index}/{len(styles)}，Render内联并发 {worker_count}",
+                        recomputed=recomputed,
+                    )
 
-                if not finished and not timed_out:
-                    time.sleep(2)
-                    continue
+                for _ in range(worker_count):
+                    submit_inline()
 
-                for proc in finished:
-                    finish_style(proc, timed_out=False)
-                    submit_next()
-                for proc in timed_out:
-                    if proc in process_map:
-                        finish_style(proc, timed_out=True)
-                        submit_next()
-        finally:
-            for proc, meta in list(process_map.items()):
-                _kill_process(proc)
+                while future_map:
+                    done, _ = wait(future_map.keys(), timeout=2, return_when=FIRST_COMPLETED)
+                    timed_out = [
+                        future
+                        for future, (_, started_at) in list(future_map.items())
+                        if time.monotonic() - started_at >= STYLE_SYNC_HARD_TIMEOUT_SECONDS and not future.done()
+                    ]
+                    for future in timed_out:
+                        style_no, _ = future_map.pop(future)
+                        future.cancel()
+                        finish_style_result(style_no, timed_out=True)
+                        submit_inline()
+                    for future in done:
+                        if future not in future_map:
+                            continue
+                        style_no, _ = future_map.pop(future)
+                        try:
+                            finish_style_result(style_no, future.result())
+                        except Exception as exc:  # noqa: BLE001
+                            finish_style_result(
+                                style_no,
+                                {"style_no": style_no, "errors": [str(exc)]},
+                                error_message=traceback.format_exc(limit=4),
+                            )
+                        submit_inline()
+        else:
+            next_index = 0
+            process_map: dict[subprocess.Popen[str], dict[str, Any]] = {}
+
+            def submit_next() -> None:
+                nonlocal next_index
+                if next_index >= len(styles):
+                    return
+                style_no = styles[next_index]
+                next_index += 1
+                WORKER_RUN_DIR.mkdir(parents=True, exist_ok=True)
+                run_key = f"{job_id}_{next_index:05d}_{style_no.replace('/', '_').replace(' ', '_')}"
+                result_path = WORKER_RUN_DIR / f"{run_key}.json"
+                log_path = WORKER_RUN_DIR / f"{run_key}.log"
+                log_handle = log_path.open("w", encoding="utf-8", errors="replace")
+                env = os.environ.copy()
+                env["STOCKX_STYLE_WORKER"] = "1"
+                env["STOCKX_STYLE_DB_PATH"] = str(settings.db_path)
+                env["STOCKX_STYLE_NO"] = style_no
+                env["STOCKX_STYLE_RESULT_PATH"] = str(result_path)
+                proc = subprocess.Popen(
+                    [sys.executable, str(Path(__file__).resolve())],
+                    cwd=str(BASE_DIR),
+                    env=env,
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                )
+                process_map[proc] = {
+                    "style_no": style_no,
+                    "started_at": time.monotonic(),
+                    "result_path": result_path,
+                    "log_path": log_path,
+                    "log_handle": log_handle,
+                }
+                _update_sync_state(
+                    job_id,
+                    completed=completed,
+                    total=len(styles),
+                    current_style=style_no,
+                    current_phase="StockX API",
+                    current_endpoint="已派发",
+                    progress=completed / len(styles) if styles else 1.0,
+                    message=f"已派发 {next_index}/{len(styles)}，并发 {worker_count}",
+                    recomputed=recomputed,
+                )
+
+            def finish_process_style(proc: subprocess.Popen[str], timed_out: bool = False) -> None:
+                meta = process_map.pop(proc, None)
+                if not meta:
+                    return
+                style_no = str(meta["style_no"])
+                result_path = Path(meta["result_path"])
+                log_path = Path(meta["log_path"])
                 try:
                     meta["log_handle"].close()
                 except Exception:
                     pass
-            process_map.clear()
+                if timed_out:
+                    _kill_process(proc)
+                    finish_style_result(style_no, timed_out=True, log_tail=_read_tail(log_path))
+                    return
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    _kill_process(proc)
+                    finish_style_result(style_no, timed_out=True, log_tail=_read_tail(log_path))
+                    return
+                result = _parse_child_result(result_path, style_no)
+                log_tail = _read_tail(log_path)
+                error_message = f"子进程退出码 {proc.returncode}" if proc.returncode not in (0, None) else None
+                finish_style_result(style_no, result, error_message=error_message, log_tail=log_tail)
+
+            try:
+                for _ in range(worker_count):
+                    submit_next()
+
+                while process_map:
+                    now_monotonic = time.monotonic()
+                    finished: list[subprocess.Popen[str]] = []
+                    timed_out: list[subprocess.Popen[str]] = []
+                    for proc, meta in list(process_map.items()):
+                        if proc.poll() is not None:
+                            finished.append(proc)
+                        elif now_monotonic - float(meta["started_at"]) >= STYLE_SYNC_HARD_TIMEOUT_SECONDS:
+                            timed_out.append(proc)
+
+                    if not finished and not timed_out:
+                        time.sleep(2)
+                        continue
+
+                    for proc in finished:
+                        finish_process_style(proc, timed_out=False)
+                        submit_next()
+                    for proc in timed_out:
+                        if proc in process_map:
+                            finish_process_style(proc, timed_out=True)
+                            submit_next()
+            finally:
+                for proc, meta in list(process_map.items()):
+                    _kill_process(proc)
+                    try:
+                        meta["log_handle"].close()
+                    except Exception:
+                        pass
+                process_map.clear()
 
         if pending_recompute:
             try_recompute_pending(pending_recompute[-1])
