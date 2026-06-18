@@ -705,6 +705,8 @@ AUTO_HOURLY_SYNC_POLL_SECONDS = 60
 AUTO_HOURLY_SYNC_MIN_INTERVAL_SECONDS = 15 * 60
 SYNC_SCORE_BATCH_SIZE = 4
 STYLE_SYNC_HARD_TIMEOUT_SECONDS = 180
+SYNC_CHECKPOINT_STYLE_INTERVAL = 8
+SYNC_CHECKPOINT_MIN_SECONDS = 120
 JOB_LOCK_PATH = BASE_DIR / "data" / "sync_job.lock"
 SYNC_STATE_PATH = BASE_DIR / "data" / "sync_state.json"
 JOB_LOCK_STALE_SECONDS = 6 * 60 * 60
@@ -3496,6 +3498,50 @@ def _run_sync_job(
         summaries: list[SyncSummary | None] = [None] * total
         completed = 0
         recomputed = 0
+        last_checkpoint_completed = 0
+        last_checkpoint_ts = 0.0
+
+        def score_count() -> int:
+            try:
+                return int(main_conn.execute("SELECT COUNT(*) FROM opportunity_scores").fetchone()[0] or 0)
+            except Exception:
+                return 0
+
+        def checkpoint_scores(force: bool = False) -> None:
+            nonlocal last_checkpoint_completed, last_checkpoint_ts
+            now_ts = time_module.monotonic()
+            should_checkpoint = (
+                force
+                or last_checkpoint_completed == 0
+                or completed - last_checkpoint_completed >= SYNC_CHECKPOINT_STYLE_INTERVAL
+                or now_ts - last_checkpoint_ts >= SYNC_CHECKPOINT_MIN_SECONDS
+            )
+            if not should_checkpoint:
+                return
+            scores = score_count()
+            if scores <= 0:
+                return
+            _update_sync_state(
+                completed=completed,
+                total=total,
+                current_phase="云端检查点",
+                current_endpoint="firebase_checkpoint",
+                progress=completed / total if total else 1.0,
+                message=f"已保存云端检查点：{completed}/{total}，评分 {scores} 条",
+                recomputed=recomputed,
+            )
+            try:
+                backup_core_tables_to_firestore(db_path_str, reason=f"manual_sync_checkpoint:{completed}/{total}")
+                last_checkpoint_completed = completed
+                last_checkpoint_ts = now_ts
+            except Exception as exc:  # noqa: BLE001
+                _append_sync_event(
+                    {
+                        "phase": "云端检查点",
+                        "status": "error",
+                        "message": f"检查点保存失败：{exc}",
+                    }
+                )
 
         def recompute_completed_batch(batch_styles: list[str]) -> bool:
             nonlocal recomputed
@@ -3529,6 +3575,7 @@ def _run_sync_job(
                 message=f"已同步 {completed}/{total}，已增量重算 {recomputed} 个尺码",
                 recomputed=recomputed,
             )
+            checkpoint_scores()
             return True
 
         if parallel_sync and total > 1:
@@ -3694,6 +3741,7 @@ def _run_sync_job(
             recomputed=recomputed,
             finished_at=datetime.utcnow().isoformat(timespec="seconds"),
         )
+        checkpoint_scores(force=True)
         schedule_cloud_backup("stockx_sync_done")
     except Exception as exc:  # noqa: BLE001
         log_sync(
@@ -6078,14 +6126,34 @@ def page_opportunity_board(conn, settings) -> None:
         and st.session_state.get("_opp_zero_score_recovery_import_id") != active_import_id
     ):
         st.session_state["_opp_zero_score_recovery_import_id"] = active_import_id
-        job_id = start_recompute_job(
-            db_path_str=str(settings.db_path),
-            fee_rate=settings.estimated_seller_fee_rate,
-            sales_fraction=settings.buy_depth_sales_fraction,
-        )
-        if job_id:
-            st.session_state["sync_notice"] = "检测到当前批次评分为0，已自动启动本地评分恢复。"
-            st.rerun()
+        if incomplete_styles:
+            job_id = start_sync_job(
+                incomplete_styles,
+                db_path_str=str(settings.db_path),
+                include_sales=True,
+                include_depth=True,
+                include_size_endpoints=True,
+                parallel_sync=True,
+                max_workers=settings.sync_max_workers,
+                fee_rate=settings.estimated_seller_fee_rate,
+                sales_fraction=settings.buy_depth_sales_fraction,
+                reset_snapshot=False,
+            )
+            if job_id:
+                st.session_state["sync_notice"] = (
+                    f"检测到当前批次评分为0，已自动继续补跑 {len(incomplete_styles)} 个未完成货号；"
+                    "不会清空已有导入或快照。"
+                )
+                st.rerun()
+        else:
+            job_id = start_recompute_job(
+                db_path_str=str(settings.db_path),
+                fee_rate=settings.estimated_seller_fee_rate,
+                sales_fraction=settings.buy_depth_sales_fraction,
+            )
+            if job_id:
+                st.session_state["sync_notice"] = "检测到当前批次评分为0，已自动启动本地评分恢复。"
+                st.rerun()
     _frontend_auto_refresh(job_running, interval_seconds=8, key="opportunity_progress")
 
     setup_tabs = st.tabs(["当前源文件 / 上传", "任务 / 数据维护", "历史结果"])
