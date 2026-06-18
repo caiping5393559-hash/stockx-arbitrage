@@ -3,11 +3,11 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import time
 import traceback
 import uuid
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -191,6 +191,39 @@ def _sync_one_style(db_path: Path, style_no: str) -> dict[str, Any]:
         worker_conn.close()
 
 
+def _run_style_child() -> int:
+    db_path = Path(os.environ["STOCKX_STYLE_DB_PATH"])
+    style_no = str(os.environ["STOCKX_STYLE_NO"]).strip().upper()
+    result = _sync_one_style(db_path, style_no)
+    print(json.dumps(result, ensure_ascii=False, default=str), flush=True)
+    return 0
+
+
+def _parse_child_result(stdout: str, style_no: str) -> dict[str, Any]:
+    for line in reversed((stdout or "").splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError:
+            continue
+    return {"style_no": style_no, "errors": ["子进程没有返回可解析结果"]}
+
+
+def _kill_process(proc: subprocess.Popen[str]) -> tuple[str, str]:
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    try:
+        return proc.communicate(timeout=10)
+    except Exception:
+        return "", ""
+
+
 def _run_full_sync() -> None:
     settings = get_settings()
     job_id = f"auto-{uuid.uuid4().hex[:8]}"
@@ -332,8 +365,7 @@ def _run_full_sync() -> None:
                     _write_marker(marker)
 
         next_index = 0
-        future_map: dict[Any, dict[str, Any]] = {}
-        executor = ThreadPoolExecutor(max_workers=worker_count)
+        process_map: dict[subprocess.Popen[str], dict[str, Any]] = {}
 
         def submit_next() -> None:
             nonlocal next_index
@@ -341,115 +373,130 @@ def _run_full_sync() -> None:
                 return
             style_no = styles[next_index]
             next_index += 1
-            future_map[executor.submit(_sync_one_style, settings.db_path, style_no)] = {
+            env = os.environ.copy()
+            env["STOCKX_STYLE_WORKER"] = "1"
+            env["STOCKX_STYLE_DB_PATH"] = str(settings.db_path)
+            env["STOCKX_STYLE_NO"] = style_no
+            proc = subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve())],
+                cwd=str(BASE_DIR),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            process_map[proc] = {
                 "style_no": style_no,
                 "started_at": time.monotonic(),
             }
+
+        def finish_style(proc: subprocess.Popen[str], timed_out: bool = False) -> None:
+            nonlocal completed, errors
+            meta = process_map.pop(proc, None)
+            if not meta:
+                return
+            completed += 1
+            style_no = str(meta["style_no"])
+            pending_recompute.append(style_no)
+            if timed_out:
+                stdout, stderr = _kill_process(proc)
+                errors += 1
+                log_sync(
+                    conn,
+                    f"自动全量同步 {style_no} 超时，已杀掉该货号进程并继续下一个",
+                    severity="error",
+                    event_type="auto_full_sync_style_timeout",
+                    style_no=style_no,
+                    details={
+                        "job_id": job_id,
+                        "timeout_seconds": STYLE_SYNC_HARD_TIMEOUT_SECONDS,
+                        "stderr_tail": (stderr or "")[-2000:],
+                        "stdout_tail": (stdout or "")[-2000:],
+                    },
+                )
+            else:
+                try:
+                    stdout, stderr = proc.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    stdout, stderr = _kill_process(proc)
+                    timed_out = True
+                if timed_out:
+                    errors += 1
+                    log_sync(
+                        conn,
+                        f"自动全量同步 {style_no} 结束读取超时，已杀掉该货号进程并继续下一个",
+                        severity="error",
+                        event_type="auto_full_sync_style_timeout",
+                        style_no=style_no,
+                        details={"job_id": job_id, "stderr_tail": (stderr or "")[-2000:]},
+                    )
+                else:
+                    result = _parse_child_result(stdout or "", style_no)
+                    style_errors = list(result.get("errors") or [])
+                    if proc.returncode not in (0, None):
+                        style_errors.append(f"子进程退出码 {proc.returncode}")
+                    if stderr:
+                        style_errors.append((stderr or "")[-2000:])
+                    errors += len(style_errors)
+                    if style_errors:
+                        log_sync(
+                            conn,
+                            f"自动全量同步 {style_no} 失败：{style_errors[0]}",
+                            severity="error",
+                            event_type="auto_full_sync_style_error",
+                            style_no=style_no,
+                            details={"job_id": job_id, "errors": style_errors[:5]},
+                        )
+            if completed == 1 or completed % 5 == 0 or completed == len(styles):
+                marker.update(
+                    {
+                        "active_job_id": job_id,
+                        "completed": completed,
+                        "total": len(styles),
+                        "current_style": style_no,
+                        "workers": worker_count,
+                        "recomputed": recomputed,
+                        "last_progress_at": _now().isoformat(timespec="seconds"),
+                        "last_progress_ts": _now().timestamp(),
+                        "last_checked_at": _now().isoformat(timespec="seconds"),
+                        "last_message": f"今日机会全量刷新StockX API中：{completed}/{len(styles)} {style_no}（并发 {worker_count}，已增量重算 {recomputed} 个尺码）",
+                    }
+                )
+                _write_marker(marker)
+                conn.commit()
+            try_recompute_pending(style_no)
 
         try:
             for _ in range(worker_count):
                 submit_next()
 
-            while future_map:
-                done, _ = wait(future_map.keys(), timeout=5, return_when=FIRST_COMPLETED)
+            while process_map:
                 now_monotonic = time.monotonic()
-                timeout_futures = [
-                    future
-                    for future, meta in list(future_map.items())
-                    if future not in done and now_monotonic - float(meta["started_at"]) >= STYLE_SYNC_HARD_TIMEOUT_SECONDS
-                ]
-                for future in list(done) + timeout_futures:
-                    meta = future_map.pop(future, None)
-                    if not meta:
-                        continue
-                    completed += 1
-                    style_no = str(meta["style_no"])
-                    pending_recompute.append(style_no)
-                    if future in timeout_futures:
-                        errors += 1
-                        future.cancel()
-                        log_sync(
-                            conn,
-                            f"自动全量同步 {style_no} 超时，已跳过继续下一个",
-                            severity="error",
-                            event_type="auto_full_sync_style_timeout",
-                            style_no=style_no,
-                            details={"job_id": job_id, "timeout_seconds": STYLE_SYNC_HARD_TIMEOUT_SECONDS},
-                        )
-                    else:
-                        try:
-                            result = future.result(timeout=1)
-                            errors += len(result.get("errors") or [])
-                        except Exception as exc:  # noqa: BLE001
-                            errors += 1
-                            log_sync(
-                                conn,
-                                f"自动全量同步 {style_no} 失败：{exc}",
-                                severity="error",
-                                event_type="auto_full_sync_style_error",
-                                style_no=style_no,
-                                details={"job_id": job_id, "error": str(exc)},
-                            )
-                    if completed == 1 or completed % 5 == 0 or completed == len(styles):
-                        marker.update(
-                            {
-                                "active_job_id": job_id,
-                                "completed": completed,
-                                "total": len(styles),
-                                "current_style": style_no,
-                                "workers": worker_count,
-                                "recomputed": recomputed,
-                                "last_progress_at": _now().isoformat(timespec="seconds"),
-                                "last_progress_ts": _now().timestamp(),
-                                "last_checked_at": _now().isoformat(timespec="seconds"),
-                                "last_message": f"今日机会全量刷新StockX API中：{completed}/{len(styles)} {style_no}（并发 {worker_count}，已增量重算 {recomputed} 个尺码）",
-                            }
-                        )
-                        _write_marker(marker)
-                        conn.commit()
-                    try_recompute_pending(style_no)
-                    submit_next()
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+                finished: list[subprocess.Popen[str]] = []
+                timed_out: list[subprocess.Popen[str]] = []
+                for proc, meta in list(process_map.items()):
+                    if proc.poll() is not None:
+                        finished.append(proc)
+                    elif now_monotonic - float(meta["started_at"]) >= STYLE_SYNC_HARD_TIMEOUT_SECONDS:
+                        timed_out.append(proc)
 
-        for batch in []:
-            with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                future_map = {executor.submit(_sync_one_style, settings.db_path, style_no): style_no for style_no in batch}
-                for future in as_completed(future_map):
-                    completed += 1
-                    style_no = future_map[future]
-                    pending_recompute.append(style_no)
-                    try:
-                        result = future.result()
-                        errors += len(result.get("errors") or [])
-                    except Exception as exc:  # noqa: BLE001
-                        errors += 1
-                        log_sync(
-                            conn,
-                            f"自动全量同步 {style_no} 失败：{exc}",
-                            severity="error",
-                            event_type="auto_full_sync_style_error",
-                            style_no=style_no,
-                            details={"job_id": job_id, "error": str(exc)},
-                        )
-                    if completed == 1 or completed % 5 == 0 or completed == len(styles):
-                        marker.update(
-                            {
-                                "active_job_id": job_id,
-                                "completed": completed,
-                                "total": len(styles),
-                                "current_style": style_no,
-                                "workers": worker_count,
-                                "recomputed": recomputed,
-                                "last_progress_at": _now().isoformat(timespec="seconds"),
-                                "last_progress_ts": _now().timestamp(),
-                                "last_checked_at": _now().isoformat(timespec="seconds"),
-                                "last_message": f"今日机会全量刷新StockX API中：{completed}/{len(styles)} {style_no}（并发 {worker_count}，已增量重算 {recomputed} 个尺码）",
-                            }
-                        )
-                        _write_marker(marker)
-                        conn.commit()
-                    try_recompute_pending(style_no)
+                if not finished and not timed_out:
+                    time.sleep(2)
+                    continue
+
+                for proc in finished:
+                    finish_style(proc, timed_out=False)
+                    submit_next()
+                for proc in timed_out:
+                    if proc in process_map:
+                        finish_style(proc, timed_out=True)
+                        submit_next()
+        finally:
+            for proc in list(process_map):
+                _kill_process(proc)
+            process_map.clear()
 
         if pending_recompute:
             try_recompute_pending(pending_recompute[-1])
@@ -549,4 +596,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    if os.environ.get("STOCKX_STYLE_WORKER") == "1":
+        raise SystemExit(_run_style_child())
     main()
