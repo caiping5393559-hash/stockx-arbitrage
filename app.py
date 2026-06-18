@@ -4592,6 +4592,63 @@ def stockx_import_progress_counts(conn, import_id: int | None, imported_scope_sq
     }
 
 
+def apply_stockx_progress_watermark(
+    conn,
+    *,
+    import_id: int | None,
+    scored_styles: int,
+    scored_sizes: int,
+    pending_styles: int,
+) -> dict[str, int]:
+    if import_id is None:
+        return {
+            "scored_styles": int(scored_styles or 0),
+            "scored_sizes": int(scored_sizes or 0),
+            "pending_styles": int(pending_styles or 0),
+        }
+    row = conn.execute(
+        """
+        SELECT scored_styles, scored_sizes, pending_styles
+        FROM stockx_import_progress_watermarks
+        WHERE import_id = ?
+        """,
+        (import_id,),
+    ).fetchone()
+    previous = dict(row) if row else {}
+    display_styles = max(int(previous.get("scored_styles") or 0), int(scored_styles or 0))
+    display_sizes = max(int(previous.get("scored_sizes") or 0), int(scored_sizes or 0))
+    previous_pending = previous.get("pending_styles")
+    if previous_pending is None:
+        display_pending = int(pending_styles or 0)
+    else:
+        display_pending = min(int(previous_pending or 0), int(pending_styles or 0))
+    conn.execute(
+        """
+        INSERT INTO stockx_import_progress_watermarks (
+            import_id, scored_styles, scored_sizes, pending_styles, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(import_id) DO UPDATE SET
+            scored_styles=MAX(stockx_import_progress_watermarks.scored_styles, excluded.scored_styles),
+            scored_sizes=MAX(stockx_import_progress_watermarks.scored_sizes, excluded.scored_sizes),
+            pending_styles=MIN(COALESCE(stockx_import_progress_watermarks.pending_styles, excluded.pending_styles), excluded.pending_styles),
+            updated_at=excluded.updated_at
+        """,
+        (
+            import_id,
+            display_styles,
+            display_sizes,
+            display_pending,
+            datetime.utcnow().isoformat(timespec="seconds"),
+        ),
+    )
+    return {
+        "scored_styles": display_styles,
+        "scored_sizes": display_sizes,
+        "pending_styles": display_pending,
+    }
+
+
 @st.cache_data(show_spinner=False)
 def load_import_summary_cached(db_path_str: str, signature: int) -> list[dict[str, Any]]:
     conn = connect(Path(db_path_str))
@@ -6526,6 +6583,16 @@ def page_opportunity_board(conn, settings) -> None:
     ).fetchone()[0] or 0
     active_import_style_set = set(imported_styles)
     incomplete_styles = [style for style in load_incomplete_stockx_skus(conn) if style in active_import_style_set]
+    progress_display = apply_stockx_progress_watermark(
+        conn,
+        import_id=active_import_id,
+        scored_styles=scored_styles,
+        scored_sizes=scored_count,
+        pending_styles=len(incomplete_styles),
+    )
+    scored_styles = int(progress_display["scored_styles"])
+    scored_count = int(progress_display["scored_sizes"])
+    display_pending_styles = int(progress_display["pending_styles"])
     sync_state = _sync_state_snapshot()
     auto_status = _auto_hourly_status_snapshot(settings)
     job_running = sync_state.get("status") == "running" or bool(auto_status.get("running"))
@@ -6541,7 +6608,7 @@ def page_opportunity_board(conn, settings) -> None:
             ("已接入商品", product_styles),
             ("已评分货号", display_scored_styles),
             ("已评分尺码", display_scored_count),
-            ("待补跑", len(incomplete_styles)),
+            ("待补跑", display_pending_styles),
         ]
     )
     retry_now_ts = datetime.utcnow().timestamp()

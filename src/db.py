@@ -111,6 +111,14 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_stockx_style_sync_status_style
             ON stockx_style_sync_status(style_no);
 
+        CREATE TABLE IF NOT EXISTS stockx_import_progress_watermarks (
+            import_id INTEGER PRIMARY KEY,
+            scored_styles INTEGER NOT NULL DEFAULT 0,
+            scored_sizes INTEGER NOT NULL DEFAULT 0,
+            pending_styles INTEGER,
+            updated_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             product_id TEXT,
