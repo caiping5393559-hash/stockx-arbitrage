@@ -2969,6 +2969,8 @@ def _auto_hourly_status_snapshot(settings) -> dict[str, Any]:
         "last_finished_at": marker.get("last_finished_at") if valid_finished_ts else None,
         "completed": completed,
         "total": total,
+        "recomputed": int(marker.get("recomputed") or 0),
+        "opportunity_scores": int(marker.get("opportunity_scores") or 0),
         "running": running,
         "stale_running": stale_running,
         "has_valid_finish": bool(valid_finished_ts),
@@ -4599,7 +4601,25 @@ def apply_stockx_progress_watermark(
     scored_styles: int,
     scored_sizes: int,
     pending_styles: int,
+    sync_state: dict[str, Any] | None = None,
+    auto_status: dict[str, Any] | None = None,
 ) -> dict[str, int]:
+    sync_state = sync_state or {}
+    auto_status = auto_status or {}
+    runtime_scored_sizes = max(
+        int(sync_state.get("recomputed") or 0),
+        int(sync_state.get("opportunity_scores") or 0),
+        int(auto_status.get("recomputed") or 0),
+        int(auto_status.get("opportunity_scores") or 0),
+    )
+    runtime_processed_styles = max(
+        int(sync_state.get("completed") or 0),
+        int(auto_status.get("completed") or 0),
+    )
+    scored_styles = max(int(scored_styles or 0), runtime_processed_styles)
+    scored_sizes = max(int(scored_sizes or 0), runtime_scored_sizes)
+    if runtime_processed_styles:
+        pending_styles = max(0, int(pending_styles or 0) - runtime_processed_styles)
     if import_id is None:
         return {
             "scored_styles": int(scored_styles or 0),
@@ -6574,6 +6594,8 @@ def page_opportunity_board(conn, settings) -> None:
     signature = db_signature(settings.db_path)
     active_import_id, imported_row_count, imported_styles, imported_scope_sql = latest_stockx_import_scope(conn)
     imported_count = len(imported_styles)
+    sync_state = _sync_state_snapshot()
+    auto_status = _auto_hourly_status_snapshot(settings)
     progress_counts = stockx_import_progress_counts(conn, active_import_id, imported_scope_sql)
     scored_count = int(progress_counts["scored_sizes"])
     scored_styles = int(progress_counts["scored_styles"])
@@ -6589,12 +6611,12 @@ def page_opportunity_board(conn, settings) -> None:
         scored_styles=scored_styles,
         scored_sizes=scored_count,
         pending_styles=len(incomplete_styles),
+        sync_state=sync_state,
+        auto_status=auto_status,
     )
     scored_styles = int(progress_display["scored_styles"])
     scored_count = int(progress_display["scored_sizes"])
     display_pending_styles = int(progress_display["pending_styles"])
-    sync_state = _sync_state_snapshot()
-    auto_status = _auto_hourly_status_snapshot(settings)
     job_running = sync_state.get("status") == "running" or bool(auto_status.get("running"))
     display_scored_styles: Any = scored_styles
     display_scored_count: Any = scored_count

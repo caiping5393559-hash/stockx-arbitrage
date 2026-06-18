@@ -93,6 +93,66 @@ def _count_opportunity_scores(conn: sqlite3.Connection) -> int:
         return 0
 
 
+def _count_import_opportunity_scores(conn: sqlite3.Connection, import_id: int | None) -> tuple[int, int]:
+    if import_id is None:
+        return (
+            int(conn.execute("SELECT COUNT(DISTINCT style_no) FROM opportunity_scores").fetchone()[0] or 0),
+            int(conn.execute("SELECT COUNT(*) FROM opportunity_scores").fetchone()[0] or 0),
+        )
+    row = conn.execute(
+        """
+        WITH imported AS (
+            SELECT DISTINCT style_no
+            FROM sku_items
+            WHERE import_id = ?
+        )
+        SELECT
+            COUNT(DISTINCT o.style_no) AS styles,
+            COUNT(*) AS sizes
+        FROM opportunity_scores o
+        JOIN imported i ON i.style_no = o.style_no
+        """,
+        (import_id,),
+    ).fetchone()
+    return (int(row["styles"] or 0), int(row["sizes"] or 0)) if row else (0, 0)
+
+
+def _write_progress_watermark(
+    conn: sqlite3.Connection,
+    *,
+    import_id: int | None,
+    scored_styles: int,
+    scored_sizes: int,
+    pending_styles: int | None = None,
+) -> None:
+    if import_id is None:
+        return
+    conn.execute(
+        """
+        INSERT INTO stockx_import_progress_watermarks (
+            import_id, scored_styles, scored_sizes, pending_styles, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(import_id) DO UPDATE SET
+            scored_styles=MAX(stockx_import_progress_watermarks.scored_styles, excluded.scored_styles),
+            scored_sizes=MAX(stockx_import_progress_watermarks.scored_sizes, excluded.scored_sizes),
+            pending_styles=CASE
+                WHEN excluded.pending_styles IS NULL THEN stockx_import_progress_watermarks.pending_styles
+                WHEN stockx_import_progress_watermarks.pending_styles IS NULL THEN excluded.pending_styles
+                ELSE MIN(stockx_import_progress_watermarks.pending_styles, excluded.pending_styles)
+            END,
+            updated_at=excluded.updated_at
+        """,
+        (
+            import_id,
+            max(0, int(scored_styles or 0)),
+            max(0, int(scored_sizes or 0)),
+            None if pending_styles is None else max(0, int(pending_styles or 0)),
+            _now().isoformat(timespec="seconds"),
+        ),
+    )
+
+
 def _timestamp(value: Any) -> float | None:
     if value in (None, ""):
         return None
@@ -214,9 +274,9 @@ def _load_incomplete_styles(conn, import_id: int | None = None) -> list[str]:
     import_filter = ""
     if import_id is not None:
         import_filter = "WHERE si.import_id = ?"
-        params = (import_id,)
+        params = (import_id, import_id, import_id)
     else:
-        params = tuple()
+        params = (None, None)
     rows = query_rows(
         conn,
         f"""
@@ -237,7 +297,16 @@ def _load_incomplete_styles(conn, import_id: int | None = None) -> list[str]:
             OR NOT EXISTS (SELECT 1 FROM product_sizes ps WHERE ps.style_no = i.style_no)
             OR NOT EXISTS (SELECT 1 FROM ask_depth a WHERE a.style_no = i.style_no)
             OR NOT EXISTS (SELECT 1 FROM sales_history s WHERE s.style_no = i.style_no)
-            OR NOT EXISTS (SELECT 1 FROM opportunity_scores o WHERE o.style_no = i.style_no)
+            OR (
+                NOT EXISTS (SELECT 1 FROM opportunity_scores o WHERE o.style_no = i.style_no)
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM stockx_style_sync_status ss
+                    WHERE ss.style_no = i.style_no
+                      AND (? IS NULL OR ss.import_id = ?)
+                      AND ss.status = 'done'
+                )
+            )
           )
         ORDER BY i.import_rank, i.style_no
         """,
@@ -406,6 +475,15 @@ def _run_full_sync() -> None:
         styles = _load_incomplete_styles(conn, import_id) if only_incomplete else _load_imported_styles(conn, import_id)
         started = _now()
         existing_scores = _count_opportunity_scores(conn)
+        existing_import_styles, existing_import_sizes = _count_import_opportunity_scores(conn, import_id)
+        _write_progress_watermark(
+            conn,
+            import_id=import_id,
+            scored_styles=max(existing_import_styles, int(marker.get("completed") or 0)),
+            scored_sizes=max(existing_import_sizes, existing_scores, int(marker.get("recomputed") or 0)),
+            pending_styles=len(styles),
+        )
+        conn.commit()
         marker.update(
             {
                 "enabled": True,
@@ -491,6 +569,15 @@ def _run_full_sync() -> None:
             pending_recompute = []
             recomputed += batch_recomputed
             score_count = _count_opportunity_scores(conn)
+            import_score_styles, import_score_sizes = _count_import_opportunity_scores(conn, import_id)
+            _write_progress_watermark(
+                conn,
+                import_id=import_id,
+                scored_styles=max(import_score_styles, completed),
+                scored_sizes=max(import_score_sizes, score_count, recomputed),
+                pending_styles=max(0, len(styles) - completed),
+            )
+            conn.commit()
             marker.update(
                 {
                     "active_job_id": job_id,
@@ -808,6 +895,15 @@ def _run_full_sync() -> None:
             try_recompute_pending(pending_recompute[-1])
 
         finished = _now()
+        import_score_styles, import_score_sizes = _count_import_opportunity_scores(conn, import_id)
+        _write_progress_watermark(
+            conn,
+            import_id=import_id,
+            scored_styles=max(import_score_styles, len(styles)),
+            scored_sizes=max(import_score_sizes, _count_opportunity_scores(conn), recomputed),
+            pending_styles=0,
+        )
+        conn.commit()
         marker.update(
             {
                 "active_job_id": None,
