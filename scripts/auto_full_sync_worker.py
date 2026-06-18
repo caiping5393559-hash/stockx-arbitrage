@@ -578,6 +578,10 @@ def _run_full_sync() -> None:
                 message=f"已处理 {completed}/{len(styles)}，已增量重算 {recomputed} 个尺码",
                 recomputed=recomputed,
             )
+            # Commit the status/log writes before opening a second connection for scoring.
+            # Otherwise SQLite can keep the writer lock on the main connection and the
+            # incremental scoring pass silently waits/returns without updating scores.
+            conn.commit()
             try_recompute_pending(style_no)
 
         inline_mode = os.environ.get("STOCKX_INLINE_STYLE_WORKER") == "1"
