@@ -4540,13 +4540,56 @@ def load_incomplete_stockx_skus(conn) -> list[str]:
             OR NOT EXISTS (SELECT 1 FROM product_sizes ps WHERE ps.style_no = i.style_no)
             OR NOT EXISTS (SELECT 1 FROM ask_depth a WHERE a.style_no = i.style_no)
             OR NOT EXISTS (SELECT 1 FROM sales_history s WHERE s.style_no = i.style_no)
-            OR NOT EXISTS (SELECT 1 FROM opportunity_scores o WHERE o.style_no = i.style_no)
+            OR (
+                NOT EXISTS (SELECT 1 FROM opportunity_scores o WHERE o.style_no = i.style_no)
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM stockx_style_sync_status ss
+                    WHERE ss.style_no = i.style_no
+                      AND (? IS NULL OR ss.import_id = ?)
+                      AND ss.status = 'done'
+                )
+            )
           )
         ORDER BY i.import_rank, i.style_no
         """,
-        (active_import_id, active_import_id),
+        (active_import_id, active_import_id, active_import_id, active_import_id),
     )
     return [str(row["style_no"]) for row in rows]
+
+
+def stockx_import_progress_counts(conn, import_id: int | None, imported_scope_sql: str) -> dict[str, int]:
+    status_where = "WHERE ss.import_id = ?" if import_id is not None else ""
+    status_params: tuple[Any, ...] = (import_id,) if import_id is not None else tuple()
+    status_row = conn.execute(
+        f"""
+        SELECT
+            COUNT(DISTINCT CASE WHEN ss.status IN ('done', 'error', 'timeout') THEN ss.style_no END) AS processed_styles,
+            COALESCE(SUM(CASE WHEN ss.status IN ('done', 'error', 'timeout') THEN COALESCE(ss.sizes_count, 0) ELSE 0 END), 0) AS processed_sizes
+        FROM stockx_style_sync_status ss
+        {status_where}
+        """,
+        status_params,
+    ).fetchone()
+    scored_styles = int(
+        conn.execute(f"SELECT COUNT(DISTINCT style_no) FROM opportunity_scores WHERE style_no IN ({imported_scope_sql})").fetchone()[0]
+        or 0
+    )
+    scored_sizes = int(
+        conn.execute(f"SELECT COUNT(*) FROM opportunity_scores WHERE style_no IN ({imported_scope_sql})").fetchone()[0]
+        or 0
+    )
+    status_data = dict(status_row) if status_row else {}
+    processed_styles = int(status_data.get("processed_styles") or 0)
+    processed_sizes = int(status_data.get("processed_sizes") or 0)
+    return {
+        "scored_styles": max(scored_styles, processed_styles),
+        "scored_sizes": max(scored_sizes, processed_sizes),
+        "opportunity_styles": scored_styles,
+        "opportunity_sizes": scored_sizes,
+        "processed_styles": processed_styles,
+        "processed_sizes": processed_sizes,
+    }
 
 
 @st.cache_data(show_spinner=False)
@@ -6474,8 +6517,9 @@ def page_opportunity_board(conn, settings) -> None:
     signature = db_signature(settings.db_path)
     active_import_id, imported_row_count, imported_styles, imported_scope_sql = latest_stockx_import_scope(conn)
     imported_count = len(imported_styles)
-    scored_count = conn.execute(f"SELECT COUNT(*) FROM opportunity_scores WHERE style_no IN ({imported_scope_sql})").fetchone()[0] or 0
-    scored_styles = conn.execute(f"SELECT COUNT(DISTINCT style_no) FROM opportunity_scores WHERE style_no IN ({imported_scope_sql})").fetchone()[0] or 0
+    progress_counts = stockx_import_progress_counts(conn, active_import_id, imported_scope_sql)
+    scored_count = int(progress_counts["scored_sizes"])
+    scored_styles = int(progress_counts["scored_styles"])
     product_styles = conn.execute(f"SELECT COUNT(DISTINCT style_no) FROM products WHERE style_no IN ({imported_scope_sql})").fetchone()[0] or 0
     missing_release_count = conn.execute(
         f"SELECT COUNT(*) FROM products WHERE style_no IN ({imported_scope_sql}) AND (release_date IS NULL OR TRIM(release_date) = '')"
