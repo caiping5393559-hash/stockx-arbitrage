@@ -3469,8 +3469,8 @@ def start_stockx_full_sync_worker_process(source: str = "manual_resume") -> dict
     if not (BASE_DIR / "scripts" / "auto_full_sync_worker.py").exists():
         return {"started": False, "reason": "missing auto_full_sync_worker.py"}
     marker = _read_auto_hourly_marker()
+    now_ts = datetime.utcnow().timestamp()
     if str(marker.get("last_status") or "") == "running" and JOB_LOCK_PATH.exists():
-        now_ts = datetime.utcnow().timestamp()
         last_touch_ts = (
             _timestamp_from_marker(marker.get("last_progress_ts"))
             or _timestamp_from_marker(marker.get("last_progress_at"))
@@ -3493,6 +3493,39 @@ def start_stockx_full_sync_worker_process(source: str = "manual_resume") -> dict
             _write_auto_hourly_marker(marker)
         else:
             return {"started": True, "queued": True, "reason": "当前StockX任务已在运行"}
+    elif JOB_LOCK_PATH.exists():
+        state = _sync_state_snapshot()
+        state_status = str(state.get("status") or "")
+        state_touch_ts = (
+            _timestamp_from_marker(state.get("updated_at"))
+            or _timestamp_from_marker(state.get("last_progress_at"))
+            or _timestamp_from_marker(state.get("started_at"))
+        )
+        lock_age = None
+        try:
+            lock_age = now_ts - JOB_LOCK_PATH.stat().st_mtime
+        except OSError:
+            lock_age = None
+        state_is_fresh_running = (
+            state_status == "running"
+            and state_touch_ts is not None
+            and now_ts - float(state_touch_ts) < 10 * 60
+        )
+        if state_is_fresh_running:
+            return {"started": True, "queued": True, "reason": "当前StockX任务已在运行"}
+        try:
+            JOB_LOCK_PATH.unlink(missing_ok=True)
+            marker.update(
+                {
+                    "last_status": "stale",
+                    "last_message": "发现StockX旧锁但没有有效运行状态，已释放旧锁并准备重启。",
+                    "last_error": "发现孤儿sync_job.lock",
+                    "last_lock_age_seconds": lock_age,
+                }
+            )
+            _write_auto_hourly_marker(marker)
+        except Exception as exc:  # noqa: BLE001
+            return {"started": False, "reason": f"旧锁释放失败：{exc}"}
     now = datetime.utcnow()
     marker.update(
         {
