@@ -7,7 +7,7 @@ import sys
 import time
 import traceback
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -18,6 +18,7 @@ sys.path.insert(0, str(BASE_DIR))
 from src.analytics import compute_and_store_opportunities  # noqa: E402
 from src.config import get_settings  # noqa: E402
 from src.db import connect, init_db, json_loads, log_sync, query_rows  # noqa: E402
+from src.firebase_cloud import backup_core_tables_to_firestore  # noqa: E402
 from src.sync import sync_style  # noqa: E402
 
 
@@ -29,6 +30,9 @@ MIN_INTERVAL_SECONDS = 15 * 60
 LOCK_STALE_SECONDS = 6 * 60 * 60
 WORKER_LOCK_STALE_SECONDS = 3 * 60 * 60
 INCREMENTAL_SCORE_BATCH_SIZE = 4
+STYLE_SYNC_HARD_TIMEOUT_SECONDS = 180
+CHECKPOINT_STYLE_INTERVAL = 10
+CHECKPOINT_MIN_SECONDS = 180
 
 
 def _now() -> datetime:
@@ -51,6 +55,13 @@ def _read_marker() -> dict[str, Any]:
 def _write_marker(data: dict[str, Any]) -> None:
     MARKER_PATH.parent.mkdir(parents=True, exist_ok=True)
     MARKER_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+
+
+def _count_opportunity_scores(conn: sqlite3.Connection) -> int:
+    try:
+        return int(conn.execute("SELECT COUNT(*) FROM opportunity_scores").fetchone()[0] or 0)
+    except Exception:
+        return 0
 
 
 def _timestamp(value: Any) -> float | None:
@@ -237,12 +248,14 @@ def _run_full_sync() -> None:
         errors = 0
         recomputed = 0
         completed = 0
+        last_checkpoint_completed = 0
+        last_checkpoint_ts = 0.0
         worker_count = max(1, min(int(settings.sync_max_workers or 4), 8, len(styles)))
         batch_size = max(1, min(worker_count, INCREMENTAL_SCORE_BATCH_SIZE))
         pending_recompute: list[str] = []
 
         def try_recompute_pending(current_style: str) -> None:
-            nonlocal recomputed, pending_recompute
+            nonlocal last_checkpoint_completed, last_checkpoint_ts, pending_recompute, recomputed
             if not pending_recompute:
                 return
             batch_styles = pending_recompute[:]
@@ -261,6 +274,7 @@ def _run_full_sync() -> None:
             pending_recompute = []
             recomputed += batch_recomputed
             conn.commit()
+            score_count = _count_opportunity_scores(conn)
             marker.update(
                 {
                     "active_job_id": job_id,
@@ -269,13 +283,132 @@ def _run_full_sync() -> None:
                     "current_style": current_style,
                     "workers": worker_count,
                     "recomputed": recomputed,
+                    "opportunity_scores": score_count,
                     "last_checked_at": _now().isoformat(timespec="seconds"),
                     "last_message": f"今日机会已同步并增量重算：{completed}/{len(styles)} 个货号，新增 {batch_recomputed} 个尺码，累计 {recomputed} 个尺码",
                 }
             )
             _write_marker(marker)
+            now_ts = _now().timestamp()
+            should_checkpoint = (
+                score_count > 0
+                and (
+                    completed == 1
+                    or completed >= len(styles)
+                    or completed - last_checkpoint_completed >= CHECKPOINT_STYLE_INTERVAL
+                    or now_ts - last_checkpoint_ts >= CHECKPOINT_MIN_SECONDS
+                )
+            )
+            if should_checkpoint:
+                try:
+                    result = backup_core_tables_to_firestore(
+                        settings.db_path,
+                        reason=f"auto_full_sync_checkpoint:{completed}/{len(styles)}",
+                    )
+                    last_checkpoint_completed = completed
+                    last_checkpoint_ts = now_ts
+                    marker.update(
+                        {
+                            "last_checkpoint_at": _now().isoformat(timespec="seconds"),
+                            "last_checkpoint_completed": completed,
+                            "last_checkpoint_scores": score_count,
+                            "last_checkpoint_ok": bool(result.get("ok")),
+                            "last_checkpoint_message": result.get("message") or "ok",
+                        }
+                    )
+                    _write_marker(marker)
+                except Exception as exc:  # noqa: BLE001
+                    marker.update(
+                        {
+                            "last_checkpoint_at": _now().isoformat(timespec="seconds"),
+                            "last_checkpoint_completed": completed,
+                            "last_checkpoint_scores": score_count,
+                            "last_checkpoint_ok": False,
+                            "last_checkpoint_message": str(exc),
+                        }
+                    )
+                    _write_marker(marker)
 
-        for batch in _chunks(styles, batch_size):
+        next_index = 0
+        future_map: dict[Any, dict[str, Any]] = {}
+        executor = ThreadPoolExecutor(max_workers=worker_count)
+
+        def submit_next() -> None:
+            nonlocal next_index
+            if next_index >= len(styles):
+                return
+            style_no = styles[next_index]
+            next_index += 1
+            future_map[executor.submit(_sync_one_style, settings.db_path, style_no)] = {
+                "style_no": style_no,
+                "started_at": time.monotonic(),
+            }
+
+        try:
+            for _ in range(worker_count):
+                submit_next()
+
+            while future_map:
+                done, _ = wait(future_map.keys(), timeout=5, return_when=FIRST_COMPLETED)
+                now_monotonic = time.monotonic()
+                timeout_futures = [
+                    future
+                    for future, meta in list(future_map.items())
+                    if future not in done and now_monotonic - float(meta["started_at"]) >= STYLE_SYNC_HARD_TIMEOUT_SECONDS
+                ]
+                for future in list(done) + timeout_futures:
+                    meta = future_map.pop(future, None)
+                    if not meta:
+                        continue
+                    completed += 1
+                    style_no = str(meta["style_no"])
+                    pending_recompute.append(style_no)
+                    if future in timeout_futures:
+                        errors += 1
+                        future.cancel()
+                        log_sync(
+                            conn,
+                            f"自动全量同步 {style_no} 超时，已跳过继续下一个",
+                            severity="error",
+                            event_type="auto_full_sync_style_timeout",
+                            style_no=style_no,
+                            details={"job_id": job_id, "timeout_seconds": STYLE_SYNC_HARD_TIMEOUT_SECONDS},
+                        )
+                    else:
+                        try:
+                            result = future.result(timeout=1)
+                            errors += len(result.get("errors") or [])
+                        except Exception as exc:  # noqa: BLE001
+                            errors += 1
+                            log_sync(
+                                conn,
+                                f"自动全量同步 {style_no} 失败：{exc}",
+                                severity="error",
+                                event_type="auto_full_sync_style_error",
+                                style_no=style_no,
+                                details={"job_id": job_id, "error": str(exc)},
+                            )
+                    if completed == 1 or completed % 5 == 0 or completed == len(styles):
+                        marker.update(
+                            {
+                                "active_job_id": job_id,
+                                "completed": completed,
+                                "total": len(styles),
+                                "current_style": style_no,
+                                "workers": worker_count,
+                                "recomputed": recomputed,
+                                "last_checked_at": _now().isoformat(timespec="seconds"),
+                                "last_message": f"今日机会全量刷新StockX API中：{completed}/{len(styles)} {style_no}（并发 {worker_count}，已增量重算 {recomputed} 个尺码）",
+                            }
+                        )
+                        _write_marker(marker)
+                        conn.commit()
+                    try_recompute_pending(style_no)
+                    submit_next()
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+        for batch in []:
             with ThreadPoolExecutor(max_workers=worker_count) as executor:
                 future_map = {executor.submit(_sync_one_style, settings.db_path, style_no): style_no for style_no in batch}
                 for future in as_completed(future_map):

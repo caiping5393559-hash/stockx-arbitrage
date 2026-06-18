@@ -13,7 +13,7 @@ import sys
 import threading
 import time as time_module
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from datetime import datetime, time, timedelta, timezone
 from html import escape
 from io import BytesIO
@@ -704,6 +704,7 @@ PAUSED_STOCKX_TASK_PATH = BASE_DIR / "data" / "paused_stockx_task.json"
 AUTO_HOURLY_SYNC_POLL_SECONDS = 60
 AUTO_HOURLY_SYNC_MIN_INTERVAL_SECONDS = 15 * 60
 SYNC_SCORE_BATCH_SIZE = 4
+STYLE_SYNC_HARD_TIMEOUT_SECONDS = 180
 JOB_LOCK_PATH = BASE_DIR / "data" / "sync_job.lock"
 SYNC_STATE_PATH = BASE_DIR / "data" / "sync_state.json"
 JOB_LOCK_STALE_SECONDS = 6 * 60 * 60
@@ -3532,28 +3533,92 @@ def _run_sync_job(
 
         if parallel_sync and total > 1:
             worker_count = min(max_workers, total)
-            batch_size = max(1, min(worker_count, SYNC_SCORE_BATCH_SIZE))
-            for batch_start in range(0, total, batch_size):
-                batch_indices = list(range(batch_start, min(batch_start + batch_size, total)))
-                completed_styles: list[str] = []
-                with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                    future_map = {
-                        executor.submit(
-                            sync_style_isolated,
-                            selected_skus[index],
-                            title_hint=title_map.get(selected_skus[index]),
-                            include_sales=include_sales,
-                            include_depth=include_depth,
-                            include_size_endpoints=include_size_endpoints,
-                            target_size=target_size if total == 1 else None,
-                            reset_snapshot=reset_snapshot,
-                            progress_callback=_sync_progress_callback,
-                        ): index
-                        for index in batch_indices
-                    }
-                    for future in as_completed(future_map):
-                        index = future_map[future]
-                        style_no = selected_skus[index]
+            completed_styles: list[str] = []
+            next_index = 0
+            future_map: dict[Any, dict[str, Any]] = {}
+            executor = ThreadPoolExecutor(max_workers=worker_count)
+
+            def submit_next() -> None:
+                nonlocal next_index
+                if next_index >= total:
+                    return
+                index = next_index
+                next_index += 1
+                style_no = selected_skus[index]
+                future = executor.submit(
+                    sync_style_isolated,
+                    style_no,
+                    title_hint=title_map.get(style_no),
+                    include_sales=include_sales,
+                    include_depth=include_depth,
+                    include_size_endpoints=include_size_endpoints,
+                    target_size=target_size if total == 1 else None,
+                    reset_snapshot=reset_snapshot,
+                    progress_callback=_sync_progress_callback,
+                )
+                future_map[future] = {"index": index, "style_no": style_no, "started": time_module.monotonic()}
+                _update_sync_state(
+                    completed=completed,
+                    total=total,
+                    current_style=style_no,
+                    current_phase="同步接口",
+                    current_endpoint="准备请求",
+                    progress=completed / total if total else 1.0,
+                    message=f"已派发 {next_index}/{total}，并发 {worker_count}",
+                    recomputed=recomputed,
+                )
+
+            try:
+                for _ in range(worker_count):
+                    submit_next()
+
+                while future_map:
+                    done, _ = wait(set(future_map), timeout=5, return_when=FIRST_COMPLETED)
+                    timed_out = [
+                        future
+                        for future, meta in list(future_map.items())
+                        if time_module.monotonic() - float(meta["started"]) >= STYLE_SYNC_HARD_TIMEOUT_SECONDS
+                    ]
+                    for future in timed_out:
+                        meta = future_map.pop(future, None)
+                        if not meta:
+                            continue
+                        index = int(meta["index"])
+                        style_no = str(meta["style_no"])
+                        future.cancel()
+                        summaries[index] = SyncSummary(
+                            style_no=style_no,
+                            product_id=None,
+                            sizes=[],
+                            errors=[f"单货号超过 {STYLE_SYNC_HARD_TIMEOUT_SECONDS} 秒，已跳过继续跑后面货号"],
+                        )
+                        completed += 1
+                        _append_sync_event(
+                            {
+                                "phase": "同步接口",
+                                "style_no": style_no,
+                                "status": "timeout",
+                                "message": f"超过 {STYLE_SYNC_HARD_TIMEOUT_SECONDS} 秒未完成，已跳过",
+                            }
+                        )
+                        _update_sync_state(
+                            completed=completed,
+                            total=total,
+                            current_style=style_no,
+                            current_phase="同步接口",
+                            current_endpoint="timeout_skip",
+                            progress=completed / total if total else 1.0,
+                            message=f"{style_no} 超时跳过；继续同步 {completed}/{total}",
+                            recomputed=recomputed,
+                        )
+                        submit_next()
+
+                    for future in done:
+                        meta = future_map.pop(future, None)
+                        if not meta:
+                            continue
+                        index = int(meta["index"])
+                        style_no = str(meta["style_no"])
                         completed_styles.append(style_no)
                         try:
                             summaries[index] = future.result()
@@ -3571,8 +3636,12 @@ def _run_sync_job(
                             message=f"已同步 {completed}/{total}，等待本批评分",
                             recomputed=recomputed,
                         )
-                        recompute_completed_batch(completed_styles)
+                        if len(completed_styles) >= SYNC_SCORE_BATCH_SIZE:
+                            recompute_completed_batch(completed_styles)
+                        submit_next()
                 recompute_completed_batch(completed_styles)
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
         else:
             completed_styles: list[str] = []
             for index, style_no in enumerate(selected_skus, start=1):
