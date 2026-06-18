@@ -707,6 +707,7 @@ SYNC_SCORE_BATCH_SIZE = 4
 STYLE_SYNC_HARD_TIMEOUT_SECONDS = 180
 SYNC_CHECKPOINT_STYLE_INTERVAL = 8
 SYNC_CHECKPOINT_MIN_SECONDS = 120
+SYNC_STARTUP_STALL_SECONDS = 5 * 60
 JOB_LOCK_PATH = BASE_DIR / "data" / "sync_job.lock"
 SYNC_STATE_PATH = BASE_DIR / "data" / "sync_state.json"
 JOB_LOCK_STALE_SECONDS = 6 * 60 * 60
@@ -958,6 +959,47 @@ def _recover_sync_state_from_logs(state: dict[str, Any]) -> dict[str, Any]:
         return recovered
     except Exception:
         return state
+
+
+def _is_sync_startup_stalled(state: dict[str, Any]) -> bool:
+    if state.get("status") != "running":
+        return False
+    try:
+        total = int(state.get("total") or 0)
+        completed = int(state.get("completed") or 0)
+    except (TypeError, ValueError):
+        return False
+    if total <= 0 or completed != 0 or state.get("current_style"):
+        return False
+    started_ts = _timestamp_from_marker(state.get("started_at"))
+    if not started_ts:
+        return False
+    return (datetime.utcnow().timestamp() - started_ts) >= SYNC_STARTUP_STALL_SECONDS
+
+
+def _mark_sync_startup_stalled(state: dict[str, Any]) -> dict[str, Any]:
+    if not _is_sync_startup_stalled(state):
+        return state
+    stalled = dict(state)
+    stalled.update(
+        {
+            "status": "error",
+            "error": "任务启动超过5分钟仍为0，已释放旧锁，允许后台worker接管。",
+            "message": "任务启动超过5分钟仍为0，已释放旧锁，允许后台worker接管。",
+            "current_phase": "启动卡死",
+            "finished_at": datetime.utcnow().isoformat(timespec="seconds"),
+            "updated_at": datetime.utcnow().isoformat(timespec="seconds"),
+        }
+    )
+    job_id = stalled.get("job_id")
+    try:
+        lock = _read_lock_file(JOB_LOCK_PATH)
+        if not job_id or lock.get("job_id") == job_id:
+            JOB_LOCK_PATH.unlink(missing_ok=True)
+    except Exception:
+        pass
+    _write_sync_state_file(stalled)
+    return stalled
 
 
 def _current_sync_run_counts(conn, state: dict[str, Any], imported_scope_sql: str) -> dict[str, int]:
@@ -3131,7 +3173,7 @@ def _sync_state_snapshot() -> dict[str, Any]:
     with SYNC_JOB_LOCK:
         memory_state = dict(SYNC_JOB_STATE)
     if memory_state.get("status") == "running":
-        return _recover_sync_state_from_logs(memory_state)
+        return _mark_sync_startup_stalled(_recover_sync_state_from_logs(memory_state))
     file_state = _read_json_path(SYNC_STATE_PATH)
     if file_state:
         if file_state.get("status") == "running":
@@ -3141,12 +3183,12 @@ def _sync_state_snapshot() -> dict[str, Any]:
             ):
                 merged = dict(lock_state)
                 merged.update(file_state)
-                return _recover_sync_state_from_logs(merged)
+                return _mark_sync_startup_stalled(_recover_sync_state_from_logs(merged))
         elif file_state.get("status") in {"done", "error"}:
             return file_state
     lock_state = _sync_state_from_lock()
     if lock_state:
-        return _recover_sync_state_from_logs(lock_state)
+        return _mark_sync_startup_stalled(_recover_sync_state_from_logs(lock_state))
     return memory_state
 
 
@@ -3356,6 +3398,61 @@ def _load_all_imported_styles_for_auto_sync(db_path: Path) -> list[str]:
         conn.close()
 
 
+def start_stockx_full_sync_worker_process(source: str = "manual_resume") -> dict[str, Any]:
+    python_exe = Path(sys.executable)
+    if not python_exe.exists():
+        return {"started": False, "reason": "missing python executable"}
+    if not (BASE_DIR / "scripts" / "auto_full_sync_worker.py").exists():
+        return {"started": False, "reason": "missing auto_full_sync_worker.py"}
+    marker = _read_auto_hourly_marker()
+    if str(marker.get("last_status") or "") == "running" and JOB_LOCK_PATH.exists():
+        return {"started": True, "queued": True, "reason": "当前StockX任务已在运行"}
+    now = datetime.utcnow()
+    marker.update(
+        {
+            "enabled": True,
+            "last_status": "starting",
+            "last_started_at": now.isoformat(timespec="seconds"),
+            "last_started_ts": now.timestamp(),
+            "last_finished_at": None,
+            "last_finished_ts": None,
+            "last_error": None,
+            "last_traceback": None,
+            "completed": 0,
+            "recomputed": 0,
+            "current_style": None,
+            "last_message": f"StockX后台worker启动中：{source}",
+        }
+    )
+    _write_auto_hourly_marker(marker)
+    try:
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        subprocess.Popen(
+            [
+                str(python_exe),
+                "-c",
+                "from scripts.auto_full_sync_worker import _run_full_sync; _run_full_sync()",
+            ],
+            cwd=str(BASE_DIR),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creationflags,
+        )
+        return {"started": True, "started_at": now.isoformat(timespec="seconds")}
+    except Exception as exc:  # noqa: BLE001
+        marker.update(
+            {
+                "last_status": "error",
+                "last_error": str(exc),
+                "last_finished_at": datetime.utcnow().isoformat(timespec="seconds"),
+                "last_message": f"StockX后台worker启动失败：{exc}",
+            }
+        )
+        _write_auto_hourly_marker(marker)
+        return {"started": False, "reason": str(exc)}
+
+
 def _auto_hourly_full_sync_loop() -> None:
     while True:
         try:
@@ -3373,18 +3470,7 @@ def _auto_hourly_full_sync_loop() -> None:
                 ):
                     imported_styles = _load_all_imported_styles_for_auto_sync(settings.db_path)
                     if imported_styles:
-                        job_id = start_sync_job(
-                            imported_styles,
-                            db_path_str=str(settings.db_path),
-                            include_sales=True,
-                            include_depth=True,
-                            include_size_endpoints=True,
-                            parallel_sync=True,
-                            max_workers=settings.sync_max_workers,
-                            fee_rate=settings.estimated_seller_fee_rate,
-                            sales_fraction=settings.buy_depth_sales_fraction,
-                            reset_snapshot=True,
-                        )
+                        worker = start_stockx_full_sync_worker_process("auto_hourly")
                         now = datetime.utcnow()
                         updated = dict(marker)
                         updated.update(
@@ -3396,23 +3482,10 @@ def _auto_hourly_full_sync_loop() -> None:
                                 "last_style_count": len(imported_styles),
                             }
                         )
-                        if job_id:
-                            updated.update(
-                            {
-                                "active_job_id": job_id,
-                                "last_started_at": now.isoformat(timespec="seconds"),
-                                "last_started_ts": now.timestamp(),
-                                "last_status": "running",
-                                "last_finished_at": None,
-                                "last_finished_ts": None,
-                                "last_error": None,
-                                "last_traceback": None,
-                                "current_style": None,
-                                "last_message": f"今日机会全量刷新StockX API已启动：{len(imported_styles)} 个货号",
-                            }
-                        )
+                        if worker.get("started"):
+                            updated["last_message"] = f"今日机会全量刷新StockX API worker已启动：{len(imported_styles)} 个货号"
                         else:
-                            updated["last_message"] = "自动全量同步到点，但当前已有任务或锁未释放"
+                            updated["last_message"] = f"自动全量同步到点，但worker未启动：{worker.get('reason') or '-'}"
                         _write_auto_hourly_marker(updated)
             else:
                 marker = dict(marker)
@@ -6127,24 +6200,15 @@ def page_opportunity_board(conn, settings) -> None:
     ):
         st.session_state["_opp_zero_score_recovery_import_id"] = active_import_id
         if incomplete_styles:
-            job_id = start_sync_job(
-                incomplete_styles,
-                db_path_str=str(settings.db_path),
-                include_sales=True,
-                include_depth=True,
-                include_size_endpoints=True,
-                parallel_sync=True,
-                max_workers=settings.sync_max_workers,
-                fee_rate=settings.estimated_seller_fee_rate,
-                sales_fraction=settings.buy_depth_sales_fraction,
-                reset_snapshot=False,
-            )
-            if job_id:
+            worker = start_stockx_full_sync_worker_process("zero_score_auto_resume")
+            if worker.get("started"):
                 st.session_state["sync_notice"] = (
-                    f"检测到当前批次评分为0，已自动继续补跑 {len(incomplete_styles)} 个未完成货号；"
-                    "不会清空已有导入或快照。"
+                    f"检测到当前批次评分为0，已自动启动独立后台worker补跑 {len(incomplete_styles)} 个未完成货号；"
+                    "本轮会分批写云端检查点。"
                 )
                 st.rerun()
+            else:
+                st.session_state["sync_notice"] = f"检测到评分为0，但后台worker未启动：{worker.get('reason') or '-'}"
         else:
             job_id = start_recompute_job(
                 db_path_str=str(settings.db_path),
