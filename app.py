@@ -4532,7 +4532,7 @@ def load_incomplete_stockx_skus(conn) -> list[str]:
               AND si.style_no IS NOT NULL
               AND TRIM(si.style_no) != ''
             GROUP BY si.style_no
-        ),
+        )
         SELECT i.style_no
         FROM imported i
         WHERE (
