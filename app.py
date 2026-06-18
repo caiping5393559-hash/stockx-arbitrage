@@ -711,7 +711,7 @@ SYNC_CHECKPOINT_MIN_SECONDS = 120
 SYNC_STARTUP_STALL_SECONDS = 5 * 60
 JOB_LOCK_PATH = BASE_DIR / "data" / "sync_job.lock"
 SYNC_STATE_PATH = BASE_DIR / "data" / "sync_state.json"
-JOB_LOCK_STALE_SECONDS = 6 * 60 * 60
+JOB_LOCK_STALE_SECONDS = 15 * 60
 OPPORTUNITY_DEFAULT_SORT_LABEL = "预计卖完天数（少到多）"
 OPPORTUNITY_SEARCH_DEFAULTS = {
     "opp_filter_style": "",
@@ -2900,10 +2900,6 @@ def _auto_hourly_status_snapshot(settings) -> dict[str, Any]:
         _timestamp_from_marker(marker.get("last_progress_ts"))
         or _timestamp_from_marker(marker.get("last_progress_at"))
         or _timestamp_from_marker(marker.get("last_checkpoint_at"))
-        or _timestamp_from_marker(marker.get("last_partial_resume_ts"))
-        or _timestamp_from_marker(marker.get("last_partial_resume_at"))
-        or _timestamp_from_marker(marker.get("last_checked_ts"))
-        or _timestamp_from_marker(marker.get("last_checked_at"))
         or started_ts
     )
     stale_no_progress = (
@@ -3431,10 +3427,6 @@ def start_stockx_full_sync_worker_process(source: str = "manual_resume") -> dict
             _timestamp_from_marker(marker.get("last_progress_ts"))
             or _timestamp_from_marker(marker.get("last_progress_at"))
             or _timestamp_from_marker(marker.get("last_checkpoint_at"))
-            or _timestamp_from_marker(marker.get("last_partial_resume_ts"))
-            or _timestamp_from_marker(marker.get("last_partial_resume_at"))
-            or _timestamp_from_marker(marker.get("last_checked_ts"))
-            or _timestamp_from_marker(marker.get("last_checked_at"))
             or _timestamp_from_marker(marker.get("last_started_ts"))
             or _timestamp_from_marker(marker.get("last_started_at"))
         )
