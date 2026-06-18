@@ -209,6 +209,43 @@ def _load_imported_styles(conn, import_id: int | None = None) -> list[str]:
     return [str(row["style_no"]).strip().upper() for row in rows if row["style_no"]]
 
 
+def _load_incomplete_styles(conn, import_id: int | None = None) -> list[str]:
+    params: tuple[Any, ...]
+    import_filter = ""
+    if import_id is not None:
+        import_filter = "WHERE si.import_id = ?"
+        params = (import_id,)
+    else:
+        params = tuple()
+    rows = query_rows(
+        conn,
+        f"""
+        WITH imported AS (
+            SELECT
+                si.style_no,
+                MIN(COALESCE(si.rank, 999999)) AS import_rank
+            FROM sku_items si
+            {import_filter}
+            GROUP BY si.style_no
+        )
+        SELECT i.style_no
+        FROM imported i
+        WHERE i.style_no IS NOT NULL
+          AND TRIM(i.style_no) != ''
+          AND (
+               NOT EXISTS (SELECT 1 FROM products p WHERE p.style_no = i.style_no)
+            OR NOT EXISTS (SELECT 1 FROM product_sizes ps WHERE ps.style_no = i.style_no)
+            OR NOT EXISTS (SELECT 1 FROM ask_depth a WHERE a.style_no = i.style_no)
+            OR NOT EXISTS (SELECT 1 FROM sales_history s WHERE s.style_no = i.style_no)
+            OR NOT EXISTS (SELECT 1 FROM opportunity_scores o WHERE o.style_no = i.style_no)
+          )
+        ORDER BY i.import_rank, i.style_no
+        """,
+        params,
+    )
+    return [str(row["style_no"]).strip().upper() for row in rows if row["style_no"]]
+
+
 def _latest_stockx_import_id(conn) -> int | None:
     row = conn.execute(
         """
@@ -365,7 +402,8 @@ def _run_full_sync() -> None:
     init_db(conn)
     try:
         import_id = _latest_stockx_import_id(conn)
-        styles = _load_imported_styles(conn, import_id)
+        only_incomplete = os.environ.get("STOCKX_SYNC_ONLY_INCOMPLETE") == "1"
+        styles = _load_incomplete_styles(conn, import_id) if only_incomplete else _load_imported_styles(conn, import_id)
         started = _now()
         existing_scores = _count_opportunity_scores(conn)
         marker.update(
@@ -376,6 +414,7 @@ def _run_full_sync() -> None:
                 "last_started_ts": started.timestamp(),
                 "last_status": "running",
                 "last_style_count": len(styles),
+                "run_scope": "incomplete" if only_incomplete else "all",
                 "completed": int(marker.get("completed") or 0),
                 "total": len(styles),
                 "recomputed": int(marker.get("recomputed") or 0),

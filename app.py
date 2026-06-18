@@ -3428,6 +3428,10 @@ def _run_stockx_full_sync_thread(source: str) -> None:
     try:
         if os.environ.get("RENDER") or os.environ.get("RENDER_SERVICE_ID"):
             os.environ["STOCKX_INLINE_STYLE_WORKER"] = "1"
+        if _stockx_worker_should_run_incomplete_only(source):
+            os.environ["STOCKX_SYNC_ONLY_INCOMPLETE"] = "1"
+        else:
+            os.environ.pop("STOCKX_SYNC_ONLY_INCOMPLETE", None)
         from scripts.auto_full_sync_worker import _run_full_sync
 
         _run_full_sync()
@@ -3462,6 +3466,11 @@ def _run_stockx_full_sync_thread(source: str) -> None:
                 "finished_at": datetime.utcnow().isoformat(timespec="seconds"),
             }
         )
+
+
+def _stockx_worker_should_run_incomplete_only(source: str) -> bool:
+    source_text = str(source or "").lower()
+    return any(token in source_text for token in ("resume", "partial", "zero_score", "incomplete"))
 
 
 def start_stockx_full_sync_worker_process(source: str = "manual_resume") -> dict[str, Any]:
@@ -3529,6 +3538,8 @@ def start_stockx_full_sync_worker_process(source: str = "manual_resume") -> dict
         except Exception as exc:  # noqa: BLE001
             return {"started": False, "reason": f"旧锁释放失败：{exc}"}
     now = datetime.utcnow()
+    existing_completed = int(marker.get("completed") or 0)
+    existing_recomputed = int(marker.get("recomputed") or 0)
     marker.update(
         {
             "enabled": True,
@@ -3539,8 +3550,9 @@ def start_stockx_full_sync_worker_process(source: str = "manual_resume") -> dict
             "last_finished_ts": None,
             "last_error": None,
             "last_traceback": None,
-            "completed": 0,
-            "recomputed": 0,
+            "completed": existing_completed,
+            "recomputed": existing_recomputed,
+            "run_scope": "incomplete" if _stockx_worker_should_run_incomplete_only(source) else "all",
             "current_style": None,
             "last_message": f"StockX后台worker启动中：{source}",
         }
@@ -3576,6 +3588,10 @@ def start_stockx_full_sync_worker_process(source: str = "manual_resume") -> dict
         log_handle = log_path.open("a", encoding="utf-8", errors="replace")
         worker_env = os.environ.copy()
         worker_env["PYTHONUNBUFFERED"] = "1"
+        if _stockx_worker_should_run_incomplete_only(source):
+            worker_env["STOCKX_SYNC_ONLY_INCOMPLETE"] = "1"
+        else:
+            worker_env.pop("STOCKX_SYNC_ONLY_INCOMPLETE", None)
         proc = subprocess.Popen(
             [
                 str(python_exe),
@@ -4517,19 +4533,9 @@ def load_incomplete_stockx_skus(conn) -> list[str]:
               AND TRIM(si.style_no) != ''
             GROUP BY si.style_no
         ),
-        completed_attempt AS (
-            SELECT style_no
-            FROM stockx_style_sync_status
-            WHERE status IN ('done', 'error', 'timeout')
-              AND (? IS NULL OR import_id = ?)
-              AND style_no IS NOT NULL
-              AND TRIM(style_no) != ''
-            GROUP BY style_no
-        )
         SELECT i.style_no
         FROM imported i
-        WHERE NOT EXISTS (SELECT 1 FROM completed_attempt ca WHERE ca.style_no = i.style_no)
-          AND (
+        WHERE (
                NOT EXISTS (SELECT 1 FROM products p WHERE p.style_no = i.style_no)
             OR NOT EXISTS (SELECT 1 FROM product_sizes ps WHERE ps.style_no = i.style_no)
             OR NOT EXISTS (SELECT 1 FROM ask_depth a WHERE a.style_no = i.style_no)
@@ -4538,7 +4544,7 @@ def load_incomplete_stockx_skus(conn) -> list[str]:
           )
         ORDER BY i.import_rank, i.style_no
         """,
-        (active_import_id, active_import_id, active_import_id, active_import_id),
+        (active_import_id, active_import_id),
     )
     return [str(row["style_no"]) for row in rows]
 
