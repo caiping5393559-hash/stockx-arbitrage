@@ -1178,15 +1178,6 @@ def compute_and_store_opportunities(
 
     if style_keys and not rows:
         return 0
-    if style_keys:
-        placeholders = ",".join("?" for _ in style_keys)
-        conn.execute(
-            f"""
-            DELETE FROM opportunity_scores
-            WHERE UPPER(REPLACE(REPLACE(style_no, ' ', ''), '-', '')) IN ({placeholders})
-            """,
-            tuple(style_keys),
-        )
 
     computed = 0
     computed_at = utc_now()

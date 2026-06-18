@@ -3973,12 +3973,14 @@ def load_import_summary_cached(db_path_str: str, signature: int) -> list[dict[st
 
 
 @st.cache_data(show_spinner=False)
-def load_imported_coverage_cached(db_path_str: str, signature: int) -> list[dict[str, Any]]:
+def load_imported_coverage_cached(db_path_str: str, signature: int, import_id: int | None = None) -> list[dict[str, Any]]:
     conn = connect(Path(db_path_str))
     try:
+        where_sql = "WHERE s.import_id = ?" if import_id is not None else ""
+        params: tuple[Any, ...] = (import_id,) if import_id is not None else tuple()
         rows = query_rows(
             conn,
-            """
+            f"""
             SELECT
                 s.style_no,
                 MIN(s.rank) AS rank,
@@ -3993,9 +3995,11 @@ def load_imported_coverage_cached(db_path_str: str, signature: int) -> list[dict
                 ON p.style_no = s.style_no
             LEFT JOIN opportunity_scores o
                 ON o.style_no = s.style_no
+            {where_sql}
             GROUP BY s.style_no
             ORDER BY COALESCE(MIN(s.rank), 999999), s.style_no
             """,
+            params,
         )
         result: list[dict[str, Any]] = []
         for row in rows:
@@ -5852,7 +5856,7 @@ def _render_opportunity_card(row: dict[str, Any], settings=None, *, refresh_disa
     st.markdown(html, unsafe_allow_html=True)
 
 
-def page_opportunities(conn, settings) -> None:
+def page_opportunity_board(conn, settings) -> None:
     _ui_page_header(
         "今日机会",
         "当前页只处理 StockX 导入货号。当前批次会保留源文件和历史结果；只有当前源文件会参与自动刷新。",
@@ -5879,20 +5883,24 @@ def page_opportunities(conn, settings) -> None:
     ).fetchone()[0] or 0
     active_import_style_set = set(imported_styles)
     incomplete_styles = [style for style in load_incomplete_stockx_skus(conn) if style in active_import_style_set]
+    sync_state = _sync_state_snapshot()
+    auto_status = _auto_hourly_status_snapshot(settings)
+    job_running = sync_state.get("status") == "running" or bool(auto_status.get("running"))
+    display_scored_styles: Any = scored_styles
+    display_scored_count: Any = scored_count
+    if job_running and product_styles > 0 and scored_count == 0:
+        display_scored_styles = "本轮评分中"
+        display_scored_count = "本轮评分中"
     _ui_status_cards(
         [
             ("当前批次", f"#{active_import_id}" if active_import_id else "-"),
             ("导入行 / 货号", f"{imported_row_count} / {imported_count}"),
             ("已接入商品", product_styles),
-            ("已评分货号", scored_styles),
-            ("已评分尺码", scored_count),
+            ("已评分货号", display_scored_styles),
+            ("已评分尺码", display_scored_count),
             ("待补跑", len(incomplete_styles)),
         ]
     )
-
-    sync_state = _sync_state_snapshot()
-    auto_status = _auto_hourly_status_snapshot(settings)
-    job_running = sync_state.get("status") == "running" or bool(auto_status.get("running"))
     if (
         active_import_id
         and product_styles > 0
@@ -6167,10 +6175,28 @@ def page_opportunities(conn, settings) -> None:
         """,
         tuple(params),
     )
+    coverage_rows = load_imported_coverage_cached(str(settings.db_path), signature, active_import_id)
+    if coverage_rows and (not export_rows or job_running):
+        with st.expander(f"当前批次已接入货号覆盖（{len(coverage_rows)}）", expanded=not export_rows):
+            coverage_frame = pd.DataFrame(coverage_rows).rename(
+                columns={
+                    "style_no": "货号",
+                    "rank": "导入排名",
+                    "title_hint": "商品名线索",
+                    "import_rows": "导入行数",
+                    "has_product_data": "已接入商品数据",
+                    "scored_sizes": "已出机会尺码",
+                    "best_rating": "最高评级",
+                    "best_score": "最高分",
+                    "status": "状态",
+                    "last_computed_at": "最近计算",
+                }
+            )
+            st.dataframe(coverage_frame, use_container_width=True, height=520, hide_index=True)
+            st.caption("这里显示的是当前上传源文件的货号覆盖情况；已接入商品数据不会因为继续补跑而重头清空。")
     if not export_rows:
         st.selectbox("显示方式", ["卡片视图", "紧凑表格", "引用数据"], disabled=True, key="opp_display_mode_empty")
-        st.info("暂无机会数据。先在「SKU 导入 / 同步」导入货号并同步接口。")
-        st.caption("卡片视角依赖 opportunity_scores 评分结果；当前筛选没有评分结果时，只能先看下面的导入货号覆盖情况。")
+        st.info("当前筛选暂无机会评分。上方已显示当前批次已接入的货号覆盖；可以点「继续补跑未完成货号」补缺口，或点「仅重算评分」用已有快照生成机会。")
     else:
         export_frame = _opportunity_export_frame(export_rows)
         export_cols = st.columns([1.2, 4])
@@ -6321,7 +6347,7 @@ def page_opportunities(conn, settings) -> None:
             st.info(f"没有找到 {query_style} / {us_size(query_size)} 的评分结果。先补齐接口并重算，或只输入已有评分的尺码。")
 
     with st.expander(f"导入货号覆盖情况（{imported_count}）", expanded=False):
-        imported_rows = load_imported_coverage_cached(str(settings.db_path), signature)
+        imported_rows = load_imported_coverage_cached(str(settings.db_path), signature, active_import_id)
         if imported_rows:
             coverage_frame = pd.DataFrame(imported_rows)
             coverage_frame = coverage_frame.rename(
@@ -6341,6 +6367,18 @@ def page_opportunities(conn, settings) -> None:
             st.dataframe(coverage_frame, use_container_width=True, height=620)
         else:
             st.info("暂无导入货号。")
+
+
+def page_opportunities(conn, settings) -> None:
+    tabs = st.tabs(["机会列表", "单尺码详情", "同货号组合", "任务 / 数据维护"])
+    with tabs[0]:
+        page_opportunity_board(conn, settings)
+    with tabs[1]:
+        page_detail(conn, settings)
+    with tabs[2]:
+        page_style_bundles(conn, settings)
+    with tabs[3]:
+        page_data_maintenance(conn, settings)
 
 
 def page_style_bundles(conn, settings) -> None:
@@ -7862,7 +7900,7 @@ def main() -> None:
         st.sidebar.success(sync_state.get("message") or "同步完成")
     elif sync_state.get("status") == "error":
         st.sidebar.error(sync_state.get("message") or sync_state.get("error") or "同步失败")
-    pages = ["今日机会", "单尺码详情", "goat寄存选品", "同货号组合", "数据维护 / 实时查价", "SKU 导入 / 同步", "持仓管理", "接口日志 / 原始 JSON", "设置"]
+    pages = ["今日机会", "goat寄存选品", "SKU 导入 / 同步", "持仓管理", "接口日志 / 原始 JSON", "设置"]
     page = st.sidebar.radio("页面", pages)
     st.sidebar.divider()
     st.sidebar.write(f"数据库：`{Path(settings.db_path).name}`")
@@ -7877,14 +7915,8 @@ def main() -> None:
 
     if page == "今日机会":
         page_opportunities(conn, settings)
-    elif page == "单尺码详情":
-        page_detail(conn, settings)
     elif page == "goat寄存选品":
         page_goat_consignment_selection(conn, settings)
-    elif page == "同货号组合":
-        page_style_bundles(conn, settings)
-    elif page == "数据维护 / 实时查价":
-        page_data_maintenance(conn, settings)
     elif page == "SKU 导入 / 同步":
         page_import_sync(conn, settings)
     elif page == "持仓管理":
