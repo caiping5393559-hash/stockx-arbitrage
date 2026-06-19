@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import gzip
 import json
+import os
 import sqlite3
 import tempfile
 from pathlib import Path
@@ -10,6 +11,10 @@ from typing import Any
 
 from .config import get_settings
 from .db import init_db, utc_now
+
+
+def _running_on_render() -> bool:
+    return bool(os.getenv("RENDER") or os.getenv("RENDER_SERVICE_ID"))
 
 
 def _firebase_modules():
@@ -659,6 +664,11 @@ def restore_sqlite_backup_if_needed(db_path: Path | str) -> bool:
     settings = get_settings()
     if not settings.firebase_enabled:
         return False
+    if _running_on_render():
+        # Render free instances have tight disk/memory limits. Restoring a large
+        # SQLite blob during Streamlit startup can restart the service before the
+        # UI is usable. Core table restore is enough for the cloud app.
+        return False
     path = Path(db_path)
     local_counts: dict[str, int] = {}
     if path.exists():
@@ -750,6 +760,8 @@ def backup_sqlite_to_firestore(db_path: Path | str, *, reason: str = "manual") -
     settings = get_settings()
     if not settings.firebase_enabled:
         return {"ok": False, "message": "Firebase disabled"}
+    if _running_on_render():
+        return {"ok": False, "message": "Skipped SQLite blob backup on Render; use core table backup only"}
     path = Path(db_path)
     if not path.exists():
         return {"ok": False, "message": f"SQLite file not found: {path}"}

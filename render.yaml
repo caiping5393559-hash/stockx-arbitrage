@@ -21,7 +21,7 @@ services:
       - key: FIREBASE_SERVICE_ACCOUNT_B64
         sync: false
       - key: FIREBASE_SQLITE_BACKUP_MAX_MB
-        value: "1500"
+        value: "50"
       - key: STOCKX_HOST
         value: http://43.136.43.128:61030/api/stockx
       - key: STOCKX_TOKEN
@@ -37,8 +37,8 @@ services:
       - key: BUY_DEPTH_SALES_FRACTION
         value: "0.75"
       - key: AUTO_FULL_SYNC_ENABLED
-        value: "true"
+        value: "false"
       - key: AUTO_FULL_SYNC_INTERVAL_MINUTES
         value: "60"
       - key: SYNC_MAX_WORKERS
-        value: "4"
+        value: "1"

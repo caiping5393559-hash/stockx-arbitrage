@@ -2823,6 +2823,17 @@ def ensure_goat_stockx_worker_process() -> dict[str, Any]:
 
 
 def start_goat_stockx_worker_request(source_name: str = "goat_rescore", *, live_refresh_missing: bool = True) -> dict[str, Any]:
+    if _render_heavy_tasks_paused():
+        marker = _read_goat_stockx_worker_marker()
+        marker.update(
+            {
+                "status": "paused",
+                "message": "Render资源超限后已暂停GOAT补StockX重任务；设置 ALLOW_RENDER_HEAVY_STOCKX_TASKS=1 才允许启动。",
+                "updated_at": datetime.utcnow().isoformat(timespec="seconds"),
+            }
+        )
+        _write_json_path(GOAT_STOCKX_WORKER_MARKER_PATH, marker)
+        return {"started": False, "reason": marker["message"]}
     GOAT_RESCORE_REQUEST_PATH.parent.mkdir(parents=True, exist_ok=True)
     marker = _read_goat_stockx_worker_marker()
     is_running = marker.get("status") == "running"
@@ -3443,6 +3454,14 @@ def _load_all_imported_styles_for_auto_sync(db_path: Path) -> list[str]:
         conn.close()
 
 
+def _running_on_render() -> bool:
+    return bool(os.environ.get("RENDER") or os.environ.get("RENDER_SERVICE_ID"))
+
+
+def _render_heavy_tasks_paused() -> bool:
+    return _running_on_render() and os.environ.get("ALLOW_RENDER_HEAVY_STOCKX_TASKS") != "1"
+
+
 def _run_stockx_full_sync_thread(source: str) -> None:
     try:
         if os.environ.get("RENDER") or os.environ.get("RENDER_SERVICE_ID"):
@@ -3493,6 +3512,18 @@ def _stockx_worker_should_run_incomplete_only(source: str) -> bool:
 
 
 def start_stockx_full_sync_worker_process(source: str = "manual_resume") -> dict[str, Any]:
+    if _render_heavy_tasks_paused():
+        marker = _read_auto_hourly_marker()
+        marker.update(
+            {
+                "enabled": False,
+                "last_status": "paused",
+                "last_message": "Render资源超限后已暂停StockX重任务；设置 ALLOW_RENDER_HEAVY_STOCKX_TASKS=1 才允许手动启动。",
+                "last_checked_at": datetime.utcnow().isoformat(timespec="seconds"),
+            }
+        )
+        _write_auto_hourly_marker(marker)
+        return {"started": False, "reason": marker["last_message"]}
     python_exe = Path(sys.executable)
     if not python_exe.exists():
         return {"started": False, "reason": "missing python executable"}
@@ -8602,15 +8633,19 @@ def _require_app_login(settings) -> bool:
 
 def main() -> None:
     settings = get_settings()
-    try:
-        restore_sqlite_backup_if_needed(Path(settings.db_path))
-        restore_core_tables_if_needed(Path(settings.db_path))
-        restore_packaged_stockx_seed_if_empty(
-            Path(settings.db_path),
-            BASE_DIR / "sample_data" / "stockx_current_seed.json.gz",
-        )
-    except Exception:
-        pass
+    startup_restore_key = "_startup_restore_checked"
+    if not st.session_state.get(startup_restore_key):
+        try:
+            if not _running_on_render():
+                restore_sqlite_backup_if_needed(Path(settings.db_path))
+            restore_core_tables_if_needed(Path(settings.db_path))
+            restore_packaged_stockx_seed_if_empty(
+                Path(settings.db_path),
+                BASE_DIR / "sample_data" / "stockx_current_seed.json.gz",
+            )
+        except Exception:
+            pass
+        st.session_state[startup_restore_key] = True
     if not _require_app_login(settings):
         return
     conn = get_conn()
@@ -8632,8 +8667,9 @@ def main() -> None:
             conn.commit()
         except Exception:
             pass
-    schedule_startup_core_backup_if_needed(settings)
-    ensure_auto_hourly_full_sync_scheduler()
+    if not _render_heavy_tasks_paused():
+        schedule_startup_core_backup_if_needed(settings)
+        ensure_auto_hourly_full_sync_scheduler()
     _refresh_cache_after_sync_if_needed()
     st.sidebar.title("套利扫描器")
     if settings.app_login_enabled:

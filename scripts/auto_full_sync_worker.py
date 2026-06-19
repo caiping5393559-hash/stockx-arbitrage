@@ -42,6 +42,14 @@ def _now() -> datetime:
     return datetime.utcnow()
 
 
+def _running_on_render() -> bool:
+    return bool(os.getenv("RENDER") or os.getenv("RENDER_SERVICE_ID"))
+
+
+def _render_heavy_tasks_paused() -> bool:
+    return _running_on_render() and os.getenv("ALLOW_RENDER_HEAVY_STOCKX_TASKS") != "1"
+
+
 def _chunks(values: list[str], size: int) -> list[list[str]]:
     if size <= 0:
         size = 1
@@ -475,6 +483,19 @@ def _kill_process(proc: subprocess.Popen[Any]) -> None:
 
 
 def _run_full_sync() -> None:
+    if _render_heavy_tasks_paused():
+        marker = _read_marker()
+        marker.update(
+            {
+                "enabled": False,
+                "active_job_id": None,
+                "last_status": "paused",
+                "last_checked_at": _now().isoformat(timespec="seconds"),
+                "last_message": "Render资源超限后已暂停StockX全量任务；设置 ALLOW_RENDER_HEAVY_STOCKX_TASKS=1 才允许运行。",
+            }
+        )
+        _write_marker(marker)
+        return
     settings = get_settings()
     job_id = f"auto-{uuid.uuid4().hex[:8]}"
     marker = _read_marker()
@@ -1031,6 +1052,18 @@ def _run_full_sync() -> None:
 
 
 def main() -> None:
+    if _render_heavy_tasks_paused():
+        marker = _read_marker()
+        marker.update(
+            {
+                "enabled": False,
+                "last_status": "paused",
+                "last_checked_at": _now().isoformat(timespec="seconds"),
+                "last_message": "Render资源超限后已暂停StockX自动全量任务。",
+            }
+        )
+        _write_marker(marker)
+        return
     if not _acquire_worker_lock():
         return
     try:
