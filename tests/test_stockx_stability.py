@@ -191,6 +191,31 @@ class StockxStabilityTests(unittest.TestCase):
         _save_score_watermark(fake_db, _FakeSettings(), {"opportunity_scores": 1900}, "unit")
         self.assertEqual(watermark.to_dict()["opportunity_scores"], 1900)
 
+    def test_score_watermark_pending_only_moves_down_when_scores_equal(self) -> None:
+        watermark = _FakeDoc(
+            {
+                "opportunity_scores": 2130,
+                "scored_sizes": 2130,
+                "scored_styles": 80,
+                "pending_styles": 899,
+            }
+        )
+        fake_db = _FakeFirestore({"stockx_score_watermark": watermark})
+        _save_score_watermark(
+            fake_db,
+            _FakeSettings(),
+            {"opportunity_scores": 2130, "scored_sizes": 2130, "scored_styles": 80, "pending_styles": 879},
+            "unit",
+        )
+        self.assertEqual(watermark.to_dict()["pending_styles"], 879)
+        _save_score_watermark(
+            fake_db,
+            _FakeSettings(),
+            {"opportunity_scores": 2130, "scored_sizes": 2130, "scored_styles": 80, "pending_styles": 899},
+            "unit",
+        )
+        self.assertEqual(watermark.to_dict()["pending_styles"], 879)
+
     def test_progress_watermark_table_is_in_cloud_backup_scope(self) -> None:
         self.assertIn("stockx_import_progress_watermarks", CORE_BACKUP_TABLES)
 

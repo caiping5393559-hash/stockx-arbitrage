@@ -233,15 +233,25 @@ def _save_score_watermark(db, settings, row_counts: dict[str, int], reason: str)
             current_styles = int(current_data.get("scored_styles") or 0)
             if current_data.get("pending_styles") is not None:
                 current_pending = int(current_data.get("pending_styles") or 0)
-        if local_scores > current_scores:
-            scored_styles = max(current_styles, int(row_counts.get("scored_styles") or 0))
-            pending_value = row_counts.get("pending_styles")
-            pending_styles = current_pending
-            if pending_value is not None:
-                pending_styles = int(pending_value or 0) if pending_styles is None else min(pending_styles, int(pending_value or 0))
+        local_styles = int(row_counts.get("scored_styles") or 0)
+        scored_styles = max(current_styles, local_styles)
+        pending_value = row_counts.get("pending_styles")
+        pending_styles = current_pending
+        if pending_value is not None:
+            local_pending = int(pending_value or 0)
+            pending_styles = local_pending if pending_styles is None else min(pending_styles, local_pending)
+        should_update = local_scores > current_scores
+        should_update = should_update or scored_styles > current_styles
+        should_update = should_update or (
+            pending_styles is not None
+            and (current_pending is None or pending_styles < current_pending)
+            and local_scores >= current_scores
+        )
+        if should_update:
+            monotonic_scores = max(current_scores, local_scores)
             payload: dict[str, Any] = {
-                "opportunity_scores": local_scores,
-                "scored_sizes": local_scores,
+                "opportunity_scores": monotonic_scores,
+                "scored_sizes": monotonic_scores,
                 "scored_styles": scored_styles,
                 "reason": reason,
                 "updated_at": utc_now(),
