@@ -325,6 +325,27 @@ def save_stockx_score_watermark(
     return {"ok": True, "before": before, "after": after, "row_counts": row_counts}
 
 
+def read_stockx_score_watermark() -> dict[str, int]:
+    settings = get_settings()
+    if not settings.firebase_enabled:
+        return {}
+    try:
+        db = firestore_client()
+        if db is None:
+            return {}
+        doc = _score_watermark_root(db, settings).get()
+        if not doc.exists:
+            return {}
+        data = doc.to_dict() or {}
+        result: dict[str, int] = {}
+        for key in ("scored_styles", "scored_sizes", "opportunity_scores", "pending_styles"):
+            if data.get(key) is not None:
+                result[key] = max(0, int(data.get(key) or 0))
+        return result
+    except Exception:
+        return {}
+
+
 def _remote_core_opportunity_score_count(db, settings) -> int:
     try:
         meta = _core_backup_root(db, settings).get()

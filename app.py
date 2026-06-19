@@ -48,6 +48,7 @@ from src.firebase_cloud import (
     backup_core_tables_to_firestore,
     backup_sqlite_to_firestore,
     firebase_status,
+    read_stockx_score_watermark,
     restore_core_tables_if_needed,
     restore_packaged_stockx_seed_if_empty,
     restore_sqlite_backup_if_needed,
@@ -6546,6 +6547,16 @@ def page_opportunity_board(conn, settings) -> None:
     ).fetchone()[0] or 0
     active_import_style_set = set(imported_styles)
     incomplete_styles = [style for style in load_incomplete_stockx_skus(conn) if style in active_import_style_set]
+    cloud_score_watermark = read_stockx_score_watermark()
+    if cloud_score_watermark:
+        scored_styles = max(scored_styles, int(cloud_score_watermark.get("scored_styles") or 0))
+        scored_count = max(
+            scored_count,
+            int(cloud_score_watermark.get("scored_sizes") or 0),
+            int(cloud_score_watermark.get("opportunity_scores") or 0),
+        )
+        if cloud_score_watermark.get("pending_styles") is not None:
+            incomplete_styles = incomplete_styles[: max(0, min(len(incomplete_styles), int(cloud_score_watermark["pending_styles"])))]
     progress_display = apply_stockx_progress_watermark(
         conn,
         import_id=active_import_id,
