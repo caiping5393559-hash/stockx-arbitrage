@@ -19,7 +19,7 @@ sys.path.insert(0, str(BASE_DIR))
 from src.analytics import compute_and_store_opportunities  # noqa: E402
 from src.config import get_settings  # noqa: E402
 from src.db import connect, init_db, json_loads, log_sync, query_rows  # noqa: E402
-from src.firebase_cloud import backup_core_tables_to_firestore  # noqa: E402
+from src.firebase_cloud import backup_core_tables_to_firestore, save_stockx_score_watermark  # noqa: E402
 from src.sync import sync_style  # noqa: E402
 
 
@@ -151,6 +151,28 @@ def _write_progress_watermark(
             _now().isoformat(timespec="seconds"),
         ),
     )
+
+
+def _save_remote_progress_watermark(
+    settings: Any,
+    *,
+    import_id: int | None,
+    scored_styles: int,
+    scored_sizes: int,
+    pending_styles: int | None,
+    reason: str,
+) -> None:
+    try:
+        save_stockx_score_watermark(
+            settings.db_path,
+            import_id=import_id,
+            scored_styles=scored_styles,
+            scored_sizes=scored_sizes,
+            pending_styles=pending_styles,
+            reason=reason,
+        )
+    except Exception:
+        pass
 
 
 def _timestamp(value: Any) -> float | None:
@@ -484,6 +506,14 @@ def _run_full_sync() -> None:
             pending_styles=len(styles),
         )
         conn.commit()
+        _save_remote_progress_watermark(
+            settings,
+            import_id=import_id,
+            scored_styles=max(existing_import_styles, int(marker.get("completed") or 0)),
+            scored_sizes=max(existing_import_sizes, existing_scores, int(marker.get("recomputed") or 0)),
+            pending_styles=len(styles),
+            reason=f"auto_full_sync_start:{job_id}",
+        )
         marker.update(
             {
                 "enabled": True,
@@ -578,6 +608,14 @@ def _run_full_sync() -> None:
                 pending_styles=max(0, len(styles) - completed),
             )
             conn.commit()
+            _save_remote_progress_watermark(
+                settings,
+                import_id=import_id,
+                scored_styles=max(import_score_styles, completed),
+                scored_sizes=max(import_score_sizes, score_count, recomputed),
+                pending_styles=max(0, len(styles) - completed),
+                reason=f"auto_full_sync_progress:{completed}/{len(styles)}",
+            )
             marker.update(
                 {
                     "active_job_id": job_id,
@@ -712,6 +750,14 @@ def _run_full_sync() -> None:
                 )
                 _write_marker(marker)
                 conn.commit()
+                _save_remote_progress_watermark(
+                    settings,
+                    import_id=import_id,
+                    scored_styles=completed,
+                    scored_sizes=max(_count_opportunity_scores(conn), recomputed),
+                    pending_styles=max(0, len(styles) - completed),
+                    reason=f"auto_full_sync_status:{completed}/{len(styles)}",
+                )
             _update_sync_state(
                 job_id,
                 completed=completed,
@@ -904,6 +950,14 @@ def _run_full_sync() -> None:
             pending_styles=0,
         )
         conn.commit()
+        _save_remote_progress_watermark(
+            settings,
+            import_id=import_id,
+            scored_styles=max(import_score_styles, len(styles)),
+            scored_sizes=max(import_score_sizes, _count_opportunity_scores(conn), recomputed),
+            pending_styles=0,
+            reason=f"auto_full_sync_done:{job_id}",
+        )
         marker.update(
             {
                 "active_job_id": None,

@@ -180,6 +180,7 @@ def _remote_opportunity_score_count(db, settings) -> int:
         if watermark.exists:
             data = watermark.to_dict() or {}
             counts.append(int(data.get("opportunity_scores") or 0))
+            counts.append(int(data.get("scored_sizes") or 0))
     except Exception:
         pass
     for root in (_core_backup_root(db, settings), _backup_root(db, settings)):
@@ -195,30 +196,133 @@ def _remote_opportunity_score_count(db, settings) -> int:
     return max(counts) if counts else 0
 
 
+def _remote_backup_opportunity_score_count(db, settings) -> int:
+    counts: list[int] = []
+    for root in (_core_backup_root(db, settings), _backup_root(db, settings)):
+        try:
+            meta = root.get()
+            if not meta.exists:
+                continue
+            data = meta.to_dict() or {}
+            row_counts = data.get("row_counts") or {}
+            counts.append(int(row_counts.get("opportunity_scores") or 0))
+        except Exception:
+            continue
+    return max(counts) if counts else 0
+
+
 def _save_score_watermark(db, settings, row_counts: dict[str, int], reason: str) -> None:
-    local_scores = int(row_counts.get("opportunity_scores") or 0)
+    local_scores = max(
+        int(row_counts.get("opportunity_scores") or 0),
+        int(row_counts.get("scored_sizes") or 0),
+    )
     if local_scores <= 0:
         return
     try:
         doc = _score_watermark_root(db, settings)
         current = doc.get()
         current_scores = 0
+        current_styles = 0
+        current_pending = None
         if current.exists:
-            current_scores = int((current.to_dict() or {}).get("opportunity_scores") or 0)
-        if local_scores > current_scores:
-            doc.set(
-                {
-                    "opportunity_scores": local_scores,
-                    "reason": reason,
-                    "updated_at": utc_now(),
-                },
-                merge=True,
+            current_data = current.to_dict() or {}
+            current_scores = max(
+                int(current_data.get("opportunity_scores") or 0),
+                int(current_data.get("scored_sizes") or 0),
             )
+            current_styles = int(current_data.get("scored_styles") or 0)
+            if current_data.get("pending_styles") is not None:
+                current_pending = int(current_data.get("pending_styles") or 0)
+        if local_scores > current_scores:
+            scored_styles = max(current_styles, int(row_counts.get("scored_styles") or 0))
+            pending_value = row_counts.get("pending_styles")
+            pending_styles = current_pending
+            if pending_value is not None:
+                pending_styles = int(pending_value or 0) if pending_styles is None else min(pending_styles, int(pending_value or 0))
+            payload: dict[str, Any] = {
+                "opportunity_scores": local_scores,
+                "scored_sizes": local_scores,
+                "scored_styles": scored_styles,
+                "reason": reason,
+                "updated_at": utc_now(),
+            }
+            if pending_styles is not None:
+                payload["pending_styles"] = pending_styles
+            doc.set(payload, merge=True)
     except Exception as exc:
         write_cloud_event(
             "score_watermark_save_failed",
             {"reason": reason, "error": str(exc), "created_at": utc_now()},
         )
+
+
+def save_stockx_score_watermark(
+    db_path: Path | str,
+    *,
+    import_id: int | None = None,
+    scored_styles: int = 0,
+    scored_sizes: int = 0,
+    pending_styles: int | None = None,
+    reason: str = "progress",
+) -> dict[str, Any]:
+    settings = get_settings()
+    if not settings.firebase_enabled:
+        return {"ok": False, "message": "Firebase disabled"}
+    db = firestore_client()
+    if db is None:
+        return {"ok": False, "message": "Firestore client not initialized"}
+
+    row_counts: dict[str, int] = {
+        "scored_styles": max(0, int(scored_styles or 0)),
+        "scored_sizes": max(0, int(scored_sizes or 0)),
+    }
+    if pending_styles is not None:
+        row_counts["pending_styles"] = max(0, int(pending_styles or 0))
+
+    path = Path(db_path)
+    if path.exists():
+        conn = sqlite3.connect(path, timeout=60)
+        conn.row_factory = sqlite3.Row
+        try:
+            init_db(conn)
+            row_counts["opportunity_scores"] = max(
+                int(row_counts.get("scored_sizes") or 0),
+                _count_table_rows(conn, "opportunity_scores"),
+            )
+            if _table_exists(conn, "stockx_import_progress_watermarks"):
+                params: tuple[Any, ...] = ()
+                where = ""
+                if import_id is not None:
+                    where = "WHERE import_id = ?"
+                    params = (import_id,)
+                row = conn.execute(
+                    f"""
+                    SELECT
+                        MAX(scored_styles) AS scored_styles,
+                        MAX(scored_sizes) AS scored_sizes,
+                        MIN(pending_styles) AS pending_styles
+                    FROM stockx_import_progress_watermarks
+                    {where}
+                    """,
+                    params,
+                ).fetchone()
+                if row:
+                    row_counts["scored_styles"] = max(row_counts["scored_styles"], int(row["scored_styles"] or 0))
+                    row_counts["scored_sizes"] = max(row_counts["scored_sizes"], int(row["scored_sizes"] or 0))
+                    row_counts["opportunity_scores"] = max(row_counts["opportunity_scores"], int(row["scored_sizes"] or 0))
+                    if row["pending_styles"] is not None:
+                        local_pending = int(row["pending_styles"] or 0)
+                        if pending_styles is None:
+                            row_counts["pending_styles"] = local_pending
+                        else:
+                            row_counts["pending_styles"] = min(row_counts["pending_styles"], local_pending)
+        finally:
+            conn.close()
+
+    before = _remote_opportunity_score_count(db, settings)
+    _save_score_watermark(db, settings, row_counts, reason)
+    after = _remote_opportunity_score_count(db, settings)
+    return {"ok": True, "before": before, "after": after, "row_counts": row_counts}
 
 
 def _remote_core_opportunity_score_count(db, settings) -> int:
@@ -235,7 +339,7 @@ def _remote_core_opportunity_score_count(db, settings) -> int:
 
 def _should_skip_regressive_score_backup(db, settings, row_counts: dict[str, int], reason: str) -> bool:
     local_scores = int(row_counts.get("opportunity_scores") or 0)
-    remote_scores = _remote_opportunity_score_count(db, settings)
+    remote_scores = _remote_backup_opportunity_score_count(db, settings)
     if local_scores < remote_scores:
         write_cloud_event(
             "backup_skipped_regressive_scores",
@@ -423,7 +527,7 @@ def restore_core_tables_if_needed(db_path: Path | str) -> bool:
     remote_items = int(remote_counts.get("sku_items") or 0)
     remote_scores = int(remote_counts.get("opportunity_scores") or 0)
     remote_score_floor = _remote_opportunity_score_count(db, settings)
-    if existing_scores > remote_scores and remote_scores < remote_score_floor:
+    if existing_imports > 0 and existing_items > 0 and existing_scores > remote_scores and remote_scores < remote_score_floor:
         write_cloud_event(
             "core_restore_skipped_regressive_scores",
             {
@@ -571,7 +675,11 @@ def restore_sqlite_backup_if_needed(db_path: Path | str) -> bool:
     sqlite_scores = int(sqlite_counts.get("opportunity_scores") or 0)
     core_scores = _remote_core_opportunity_score_count(db, settings)
     remote_score_floor = _remote_opportunity_score_count(db, settings)
-    if _should_skip_regressive_sqlite_restore(sqlite_scores, max(core_scores, remote_score_floor)):
+    local_has_source = (
+        int(local_counts.get("sku_imports") or 0) > 0
+        and int(local_counts.get("sku_items") or 0) > 0
+    )
+    if local_has_source and _should_skip_regressive_sqlite_restore(sqlite_scores, max(core_scores, remote_score_floor)):
         write_cloud_event(
             "sqlite_restore_skipped_regressive_scores",
             {

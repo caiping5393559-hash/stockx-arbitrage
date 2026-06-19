@@ -7,6 +7,7 @@ import pandas as pd
 from src.db import init_db
 from src.firebase_cloud import (
     CORE_BACKUP_TABLES,
+    _remote_backup_opportunity_score_count,
     _remote_opportunity_score_count,
     _save_score_watermark,
     _should_skip_regressive_score_backup,
@@ -147,11 +148,29 @@ class StockxStabilityTests(unittest.TestCase):
             }
         )
         self.assertEqual(_remote_opportunity_score_count(fake_db, _FakeSettings()), 2537)
-        self.assertTrue(
+
+    def test_backup_regression_check_ignores_display_watermark(self) -> None:
+        fake_db = _FakeFirestore(
+            {
+                "stockx_score_watermark": _FakeDoc({"opportunity_scores": 2537}),
+                "core_backup": _FakeDoc({"row_counts": {"opportunity_scores": 1598}}),
+                "sqlite_backup": _FakeDoc({"row_counts": {"opportunity_scores": 1598}}),
+            }
+        )
+        self.assertEqual(_remote_backup_opportunity_score_count(fake_db, _FakeSettings()), 1598)
+        self.assertFalse(
             _should_skip_regressive_score_backup(
                 fake_db,
                 _FakeSettings(),
                 {"opportunity_scores": 1836},
+                "unit",
+            )
+        )
+        self.assertTrue(
+            _should_skip_regressive_score_backup(
+                fake_db,
+                _FakeSettings(),
+                {"opportunity_scores": 1500},
                 "unit",
             )
         )
