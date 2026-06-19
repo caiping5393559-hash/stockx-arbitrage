@@ -360,14 +360,14 @@ def _remote_core_opportunity_score_count(db, settings) -> int:
 
 def _should_skip_regressive_score_backup(db, settings, row_counts: dict[str, int], reason: str) -> bool:
     local_scores = int(row_counts.get("opportunity_scores") or 0)
-    remote_scores = _remote_backup_opportunity_score_count(db, settings)
+    remote_scores = _remote_opportunity_score_count(db, settings)
     if local_scores < remote_scores:
         write_cloud_event(
             "backup_skipped_regressive_scores",
             {
                 "reason": reason,
                 "local_opportunity_scores": local_scores,
-                "remote_opportunity_scores": remote_scores,
+                "remote_opportunity_score_floor": remote_scores,
                 "created_at": utc_now(),
             },
         )

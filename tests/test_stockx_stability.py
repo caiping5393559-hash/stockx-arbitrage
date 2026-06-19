@@ -149,7 +149,7 @@ class StockxStabilityTests(unittest.TestCase):
         )
         self.assertEqual(_remote_opportunity_score_count(fake_db, _FakeSettings()), 2537)
 
-    def test_backup_regression_check_ignores_display_watermark(self) -> None:
+    def test_backup_regression_check_respects_score_watermark_floor(self) -> None:
         fake_db = _FakeFirestore(
             {
                 "stockx_score_watermark": _FakeDoc({"opportunity_scores": 2537}),
@@ -158,7 +158,7 @@ class StockxStabilityTests(unittest.TestCase):
             }
         )
         self.assertEqual(_remote_backup_opportunity_score_count(fake_db, _FakeSettings()), 1598)
-        self.assertFalse(
+        self.assertTrue(
             _should_skip_regressive_score_backup(
                 fake_db,
                 _FakeSettings(),
@@ -171,6 +171,14 @@ class StockxStabilityTests(unittest.TestCase):
                 fake_db,
                 _FakeSettings(),
                 {"opportunity_scores": 1500},
+                "unit",
+            )
+        )
+        self.assertFalse(
+            _should_skip_regressive_score_backup(
+                fake_db,
+                _FakeSettings(),
+                {"opportunity_scores": 2537},
                 "unit",
             )
         )
